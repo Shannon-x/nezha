@@ -30,6 +30,11 @@ jobs:
           go-version: "1.25.x"
           check-latest: true
 
+      - name: Download GeoIP database
+        run: |
+          curl -L -o pkg/geoip/geoip.db https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db
+        shell: bash
+
       - name: generate swagger docs
         run: |
           go install github.com/swaggo/swag/cmd/swag@latest

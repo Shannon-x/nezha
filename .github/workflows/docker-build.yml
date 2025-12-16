@@ -42,6 +42,13 @@ jobs:
           ls -la cmd/dashboard/admin-dist/
           ls -la cmd/dashboard/user-dist/
 
+      - name: Download GeoIP database
+        run: |
+          echo "Downloading GeoIP database from sing-geoip..."
+          curl -L -o pkg/geoip/geoip.db https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db
+          echo "GeoIP database downloaded successfully!"
+          ls -la pkg/geoip/
+
       - name: Generate swagger docs
         run: |
           go install github.com/swaggo/swag/cmd/swag@latest
