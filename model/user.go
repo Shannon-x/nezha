@@ -23,7 +23,7 @@ const DefaultAgentSecretLength = 32
 
 type User struct {
 	Common
-	Username       string `json:"username,omitempty" gorm:"uniqueIndex"`
+	Username       string `json:"username,omitempty" gorm:"type:varchar(191);uniqueIndex"`
 	Password       string `json:"password,omitempty" gorm:"type:char(72)"`
 	Role           Role   `json:"role,omitempty"`
 	AgentSecret    string `json:"agent_secret,omitempty" gorm:"type:char(32)"`
