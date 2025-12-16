@@ -42,11 +42,13 @@ jobs:
           ls -la cmd/dashboard/admin-dist/
           ls -la cmd/dashboard/user-dist/
 
-      - name: Download GeoIP database
+      - name: Fetch IPInfo GeoIP Database
+        env:
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
         run: |
-          echo "Downloading GeoIP database from sing-geoip..."
-          curl -L -o pkg/geoip/geoip.db https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db
-          echo "GeoIP database downloaded successfully!"
+          rm pkg/geoip/geoip.db
+          wget -qO pkg/geoip/geoip.db "https://ipinfo.io/data/free/country.mmdb?token=${IPINFO_TOKEN}"
+          echo "IPinfo GeoIP database downloaded successfully!"
           ls -la pkg/geoip/
 
       - name: Generate swagger docs
