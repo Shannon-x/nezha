@@ -21,11 +21,25 @@ jobs:
         with:
           go-version: "1.22.x"
 
-      - name: Prepare frontend placeholders
+      - name: Download frontend resources
         run: |
-          mkdir -p cmd/dashboard/admin-dist cmd/dashboard/user-dist
-          echo '<!-- placeholder -->' > cmd/dashboard/admin-dist/index.html
-          echo '<!-- placeholder -->' > cmd/dashboard/user-dist/index.html
+          # 下载管理后台 (nezhahq/admin-frontend)
+          echo "Downloading admin-frontend..."
+          curl -L -o admin-dist.zip https://github.com/nezhahq/admin-frontend/releases/download/v1.14.4/dist.zip
+          unzip -q admin-dist.zip -d cmd/dashboard/
+          mv cmd/dashboard/dist cmd/dashboard/admin-dist
+          rm admin-dist.zip
+          
+          # 下载用户前台 (hamster1963/nezha-dash-v1)
+          echo "Downloading user-frontend..."
+          curl -L -o user-dist.zip https://github.com/hamster1963/nezha-dash-v1/releases/download/v1.32.0/dist.zip
+          unzip -q user-dist.zip -d cmd/dashboard/
+          mv cmd/dashboard/dist cmd/dashboard/user-dist
+          rm user-dist.zip
+          
+          echo "Frontend resources downloaded successfully!"
+          ls -la cmd/dashboard/admin-dist/
+          ls -la cmd/dashboard/user-dist/
 
       - name: Generate swagger docs
         run: |
@@ -67,3 +81,4 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
