@@ -36,16 +36,24 @@ func Lookup(ip net.IP) (string, error) {
 		return "", err
 	}
 
+	// Try IPinfo format first (struct with country field)
 	var record IPInfo
 	err = db.Lookup(ip, &record)
+	if err == nil && record.Country != "" {
+		return strings.ToLower(record.Country), nil
+	}
+	if err == nil && record.Continent != "" {
+		return strings.ToLower(record.Continent), nil
+	}
+
+	// Fallback: try sing-geoip format (direct string)
+	var countryCode string
+	err = db.Lookup(ip, &countryCode)
 	if err != nil {
 		return "", err
 	}
-
-	if record.Country != "" {
-		return strings.ToLower(record.Country), nil
-	} else if record.Continent != "" {
-		return strings.ToLower(record.Continent), nil
+	if countryCode != "" {
+		return strings.ToLower(countryCode), nil
 	}
 
 	return "", errors.New("IP not found")
