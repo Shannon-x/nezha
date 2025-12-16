@@ -5,7 +5,7 @@ import (
 )
 
 type ServiceHistory struct {
-	ID        uint64    `gorm:"primaryKey" json:"id,omitempty"`
+	ID        uint64    `gorm:"primaryKey;autoIncrement" json:"id,omitempty"`
 	CreatedAt time.Time `gorm:"index;<-:create;index:idx_server_id_created_at_service_id_avg_delay" json:"created_at,omitempty"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at,omitempty"`
 	ServiceID uint64    `gorm:"index:idx_server_id_created_at_service_id_avg_delay" json:"service_id,omitempty"`
