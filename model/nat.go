@@ -6,5 +6,5 @@ type NAT struct {
 	Name     string `json:"name"`
 	ServerID uint64 `json:"server_id"`
 	Host     string `json:"host"`
-	Domain   string `json:"domain" gorm:"unique"`
+	Domain   string `json:"domain" gorm:"type:varchar(255);unique"`
 }

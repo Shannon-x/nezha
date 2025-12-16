@@ -15,7 +15,7 @@ type Server struct {
 	Common
 
 	Name                   string `json:"name"`
-	UUID                   string `json:"uuid,omitempty" gorm:"unique"`
+	UUID                   string `json:"uuid,omitempty" gorm:"type:varchar(36);unique"`
 	Note                   string `json:"note,omitempty"`           // 管理员可见备注
 	PublicNote             string `json:"public_note,omitempty"`    // 公开备注
 	DisplayIndex           int    `json:"display_index"`            // 展示排序，越大越靠前
