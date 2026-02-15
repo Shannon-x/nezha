@@ -1,21 +1,41 @@
-FROM alpine AS depend
-RUN apk add --update --no-cache ca-certificates tzdata
+FROM golang:1.25-alpine AS builder
 
-FROM busybox:stable-musl
+# Install build dependencies
+RUN apk add --no-cache git gcc musl-dev
 
-ARG TARGETOS
-ARG TARGETARCH
+WORKDIR /app
 
-COPY --from=depend /etc/ssl/certs /etc/ssl/certs
-COPY --from=depend /usr/share/zoneinfo /usr/share/zoneinfo
-COPY ./script/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Copy go mod files
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Generate swagger docs
+RUN go install github.com/swaggo/swag/cmd/swag@latest && \
+    mkdir -p cmd/dashboard/admin-dist cmd/dashboard/user-dist && \
+    if [ ! -f cmd/dashboard/admin-dist/index.html ]; then echo '<!-- placeholder -->' > cmd/dashboard/admin-dist/index.html; fi && \
+    if [ ! -f cmd/dashboard/user-dist/index.html ]; then echo '<!-- placeholder -->' > cmd/dashboard/user-dist/index.html; fi && \
+    swag init -g cmd/dashboard/main.go -o cmd/dashboard/docs --parseDependency || true
+
+# Build the application
+RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o dashboard ./cmd/dashboard
+
+# Final stage
+FROM alpine:latest
+
+RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /dashboard
-COPY dist/dashboard-${TARGETOS}-${TARGETARCH} ./app
+
+COPY --from=builder /app/dashboard ./app
+COPY script/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 VOLUME ["/dashboard/data"]
 EXPOSE 8008
 ARG TZ=Asia/Shanghai
 ENV TZ=$TZ
+
 ENTRYPOINT ["/entrypoint.sh"]
