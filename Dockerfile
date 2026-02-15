@@ -19,12 +19,12 @@ RUN go install github.com/swaggo/swag/cmd/swag@latest && \
 # Download frontend resources
 RUN apt-get update && apt-get install -y unzip wget && \
     # Admin Frontend
-    wget -qO admin-dist.zip https://github.com/nezhahq/admin-frontend/releases/download/v1.14.4/dist.zip && \
+    wget -qO admin-dist.zip https://github.com/nezhahq/admin-frontend/releases/latest/download/dist.zip && \
     unzip -q admin-dist.zip -d cmd/dashboard/ && \
     mv cmd/dashboard/dist/* cmd/dashboard/admin-dist/ && \
     rm -rf cmd/dashboard/dist admin-dist.zip && \
     # User Frontend
-    wget -qO user-dist.zip https://github.com/hamster1963/nezha-dash-v1/releases/download/v1.32.0/dist.zip && \
+    wget -qO user-dist.zip https://github.com/hamster1963/nezha-dash-v1/releases/latest/download/dist.zip && \
     unzip -q user-dist.zip -d cmd/dashboard/ && \
     mv cmd/dashboard/dist/* cmd/dashboard/user-dist/ && \
     rm -rf cmd/dashboard/dist user-dist.zip && \
