@@ -17,25 +17,33 @@ RUN go install github.com/swaggo/swag/cmd/swag@latest && \
     mkdir -p cmd/dashboard/admin-dist cmd/dashboard/user-dist
 
 # Download frontend resources
-RUN apt-get update && apt-get install -y unzip wget && \
+# Download frontend resources
+RUN apt-get update && apt-get install -y unzip curl && \
     # Admin Frontend
-    wget -qO admin-dist.zip https://github.com/nezhahq/admin-frontend/releases/latest/download/dist.zip && \
-    unzip -q admin-dist.zip -d cmd/dashboard/ && \
+    echo "Downloading Admin Frontend..." && \
+    curl -L -o admin-dist.zip https://github.com/nezhahq/admin-frontend/releases/latest/download/dist.zip && \
+    echo "Unzipping Admin Frontend..." && \
+    unzip admin-dist.zip -d cmd/dashboard/ && \
+    ls -la cmd/dashboard/dist/ && \
     mv cmd/dashboard/dist/* cmd/dashboard/admin-dist/ && \
     rm -rf cmd/dashboard/dist admin-dist.zip && \
     # User Frontend
-    wget -qO user-dist.zip https://github.com/hamster1963/nezha-dash-v1/releases/latest/download/dist.zip && \
-    unzip -q user-dist.zip -d cmd/dashboard/ && \
+    echo "Downloading User Frontend..." && \
+    curl -L -o user-dist.zip https://github.com/hamster1963/nezha-dash-v1/releases/latest/download/dist.zip && \
+    echo "Unzipping User Frontend..." && \
+    unzip user-dist.zip -d cmd/dashboard/ && \
+    ls -la cmd/dashboard/dist/ && \
     mv cmd/dashboard/dist/* cmd/dashboard/user-dist/ && \
     rm -rf cmd/dashboard/dist user-dist.zip && \
     # IPInfo GeoIP
-    wget -qO pkg/geoip/geoip.db https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db
+    echo "Downloading GeoIP Database..." && \
+    curl -L -o pkg/geoip/geoip.db https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db
 
 # Generate swagger (after frontend assets are in place, though swag doesn't strictly depend on them but main.go might embed them)
 RUN swag init -g cmd/dashboard/main.go -o cmd/dashboard/docs --parseDependency || true
 
 # Build the application
-RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o dashboard ./cmd/dashboard
+RUN CGO_ENABLED=1 go build -v -ldflags="-s -w" -o dashboard ./cmd/dashboard
 
 # Final stage
 FROM debian:bookworm-slim
