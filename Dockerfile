@@ -1,7 +1,7 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.25-bookworm AS builder
 
 # Install build dependencies
-RUN apk add --no-cache git gcc musl-dev
+RUN apt-get update && apt-get install -y git gcc libc6-dev ca-certificates
 
 WORKDIR /app
 
@@ -14,18 +14,33 @@ COPY . .
 
 # Generate swagger docs
 RUN go install github.com/swaggo/swag/cmd/swag@latest && \
-    mkdir -p cmd/dashboard/admin-dist cmd/dashboard/user-dist && \
-    if [ ! -f cmd/dashboard/admin-dist/index.html ]; then echo '<!-- placeholder -->' > cmd/dashboard/admin-dist/index.html; fi && \
-    if [ ! -f cmd/dashboard/user-dist/index.html ]; then echo '<!-- placeholder -->' > cmd/dashboard/user-dist/index.html; fi && \
-    swag init -g cmd/dashboard/main.go -o cmd/dashboard/docs --parseDependency || true
+    mkdir -p cmd/dashboard/admin-dist cmd/dashboard/user-dist
+
+# Download frontend resources
+RUN apt-get update && apt-get install -y unzip wget && \
+    # Admin Frontend
+    wget -qO admin-dist.zip https://github.com/nezhahq/admin-frontend/releases/download/v1.14.4/dist.zip && \
+    unzip -q admin-dist.zip -d cmd/dashboard/ && \
+    mv cmd/dashboard/dist/* cmd/dashboard/admin-dist/ && \
+    rm -rf cmd/dashboard/dist admin-dist.zip && \
+    # User Frontend
+    wget -qO user-dist.zip https://github.com/hamster1963/nezha-dash-v1/releases/download/v1.32.0/dist.zip && \
+    unzip -q user-dist.zip -d cmd/dashboard/ && \
+    mv cmd/dashboard/dist/* cmd/dashboard/user-dist/ && \
+    rm -rf cmd/dashboard/dist user-dist.zip && \
+    # IPInfo GeoIP
+    wget -qO pkg/geoip/geoip.db https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db
+
+# Generate swagger (after frontend assets are in place, though swag doesn't strictly depend on them but main.go might embed them)
+RUN swag init -g cmd/dashboard/main.go -o cmd/dashboard/docs --parseDependency || true
 
 # Build the application
 RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o dashboard ./cmd/dashboard
 
 # Final stage
-FROM alpine:latest
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apt-get update && apt-get install -y ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /dashboard
 
