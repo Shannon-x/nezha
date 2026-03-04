@@ -251,11 +251,14 @@ func (s *SQLStore) QueryServiceHistory(serviceID uint64, period QueryPeriod) (*S
 
 	since := time.Now().Add(-period.Duration())
 
-	var records []TSDBServiceMetric
-	if err := s.db.Where("service_id = ? AND created_at >= ?", serviceID, since).
-		Order("server_id, created_at").Find(&records).Error; err != nil {
+	rows, err := s.db.Model(&TSDBServiceMetric{}).
+		Select("server_id, delay, status, created_at").
+		Where("service_id = ? AND created_at >= ?", serviceID, since).
+		Order("server_id, created_at").Rows()
+	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	result := &ServiceHistoryResult{
 		ServiceID: serviceID,
@@ -264,11 +267,18 @@ func (s *SQLStore) QueryServiceHistory(serviceID uint64, period QueryPeriod) (*S
 
 	// 按 server_id 分组
 	grouped := make(map[uint64][]rawDataPoint)
-	for _, r := range records {
-		grouped[r.ServerID] = append(grouped[r.ServerID], rawDataPoint{
-			timestamp: r.CreatedAt.UnixMilli(),
-			value:     r.Delay,
-			status:    float64(r.Status),
+	for rows.Next() {
+		var serverID uint64
+		var delay float64
+		var status uint8
+		var createdAt time.Time
+		if err := rows.Scan(&serverID, &delay, &status, &createdAt); err != nil {
+			continue
+		}
+		grouped[serverID] = append(grouped[serverID], rawDataPoint{
+			timestamp: createdAt.UnixMilli(),
+			value:     delay,
+			status:    float64(status),
 			hasDelay:  true,
 			hasStatus: true,
 		})
@@ -300,24 +310,33 @@ func (s *SQLStore) QueryServiceDailyStats(serviceID uint64, today time.Time, day
 	start := today.AddDate(0, 0, -(days - 1))
 	stats := make([]DailyServiceStats, days)
 
-	var records []TSDBServiceMetric
-	if err := s.db.Where("service_id = ? AND created_at >= ? AND created_at < ?", serviceID, start, today).
-		Find(&records).Error; err != nil {
+	rows, err := s.db.Model(&TSDBServiceMetric{}).
+		Select("delay, status, created_at").
+		Where("service_id = ? AND created_at >= ? AND created_at < ?", serviceID, start, today).
+		Rows()
+	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	delayCount := make([]int, days)
-	for _, r := range records {
-		dayIndex := (days - 1) - int(today.Sub(r.CreatedAt).Hours())/24
+	for rows.Next() {
+		var delay float64
+		var status uint8
+		var createdAt time.Time
+		if err := rows.Scan(&delay, &status, &createdAt); err != nil {
+			continue
+		}
+		dayIndex := (days - 1) - int(today.Sub(createdAt).Hours())/24
 		if dayIndex < 0 || dayIndex >= days {
 			continue
 		}
-		if r.Status >= 1 {
+		if status >= 1 {
 			stats[dayIndex].Up++
 		} else {
 			stats[dayIndex].Down++
 		}
-		stats[dayIndex].Delay = (stats[dayIndex].Delay*float64(delayCount[dayIndex]) + r.Delay) / float64(delayCount[dayIndex]+1)
+		stats[dayIndex].Delay = (stats[dayIndex].Delay*float64(delayCount[dayIndex]) + delay) / float64(delayCount[dayIndex]+1)
 		delayCount[dayIndex]++
 	}
 
@@ -334,17 +353,25 @@ func (s *SQLStore) QueryServerMetrics(serverID uint64, metric MetricType, period
 
 	since := time.Now().Add(-period.Duration())
 
-	var records []TSDBServerMetric
-	if err := s.db.Where("server_id = ? AND metric_name = ? AND created_at >= ?", serverID, string(metric), since).
-		Order("created_at").Find(&records).Error; err != nil {
+	rows, err := s.db.Model(&TSDBServerMetric{}).
+		Select("value, created_at").
+		Where("server_id = ? AND metric_name = ? AND created_at >= ?", serverID, string(metric), since).
+		Order("created_at").Rows()
+	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
-	points := make([]rawDataPoint, 0, len(records))
-	for _, r := range records {
+	var points []rawDataPoint
+	for rows.Next() {
+		var value float64
+		var createdAt time.Time
+		if err := rows.Scan(&value, &createdAt); err != nil {
+			continue
+		}
 		points = append(points, rawDataPoint{
-			timestamp: r.CreatedAt.UnixMilli(),
-			value:     r.Value,
+			timestamp: createdAt.UnixMilli(),
+			value:     value,
 		})
 	}
 
@@ -361,19 +388,29 @@ func (s *SQLStore) QueryServiceHistoryByServerID(serverID uint64, period QueryPe
 
 	since := time.Now().Add(-period.Duration())
 
-	var records []TSDBServiceMetric
-	if err := s.db.Where("server_id = ? AND created_at >= ?", serverID, since).
-		Order("service_id, created_at").Find(&records).Error; err != nil {
+	rows, err := s.db.Model(&TSDBServiceMetric{}).
+		Select("service_id, delay, status, created_at").
+		Where("server_id = ? AND created_at >= ?", serverID, since).
+		Order("service_id, created_at").Rows()
+	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	// 按 service_id 分组
 	grouped := make(map[uint64][]rawDataPoint)
-	for _, r := range records {
-		grouped[r.ServiceID] = append(grouped[r.ServiceID], rawDataPoint{
-			timestamp: r.CreatedAt.UnixMilli(),
-			value:     r.Delay,
-			status:    float64(r.Status),
+	for rows.Next() {
+		var serviceID uint64
+		var delay float64
+		var status uint8
+		var createdAt time.Time
+		if err := rows.Scan(&serviceID, &delay, &status, &createdAt); err != nil {
+			continue
+		}
+		grouped[serviceID] = append(grouped[serviceID], rawDataPoint{
+			timestamp: createdAt.UnixMilli(),
+			value:     delay,
+			status:    float64(status),
 			hasDelay:  true,
 			hasStatus: true,
 		})
