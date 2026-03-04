@@ -13,8 +13,7 @@ RUN go mod download
 COPY . .
 
 # Generate swagger docs
-RUN go install github.com/swaggo/swag/cmd/swag@latest && \
-    mkdir -p cmd/dashboard/admin-dist cmd/dashboard/user-dist
+RUN go install github.com/swaggo/swag/cmd/swag@latest
 
 
 # Generate swagger (after frontend assets are in place, though swag doesn't strictly depend on them but main.go might embed them)
