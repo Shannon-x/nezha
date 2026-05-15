@@ -335,6 +335,10 @@ func batchMoveServer(c *gin.Context) (any, error) {
 		return nil, singleton.Localizer.ErrorT("user id is required")
 	}
 
+	if !callerIsAdmin(c) && moveForm.ToUser != getUid(c) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+
 	singleton.UserLock.RLock()
 	defer singleton.UserLock.RUnlock()
 	if _, ok := singleton.UserInfoMap[moveForm.ToUser]; !ok {
