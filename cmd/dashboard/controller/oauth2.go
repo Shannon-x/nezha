@@ -66,9 +66,19 @@ func oauth2redirect(c *gin.Context) (*model.Oauth2LoginResponse, error) {
 	}, cache.DefaultExpiration)
 
 	url := o2conf.AuthCodeURL(state, oauth2.AccessTypeOnline)
-	c.SetCookie("nz-o2s", stateKey, 60*5, "", "", false, false)
+	writeOauth2StateCookie(c, stateKey)
 
 	return &model.Oauth2LoginResponse{Redirect: url}, nil
+}
+
+// writeOauth2StateCookie sets the nz-o2s cookie used to authenticate the
+// OAuth2 callback. Secure is set when the request arrives over HTTPS;
+// HttpOnly is enabled unconditionally — the frontend does not read this
+// cookie, only the dashboard's callback handler does, so HTTP-only access
+// is strictly an XSS-hardening win.
+func writeOauth2StateCookie(c *gin.Context, stateKey string) {
+	secure := c.Request.URL.Scheme == "https" || c.Request.TLS != nil
+	c.SetCookie("nz-o2s", stateKey, 60*5, "", "", secure, true)
 }
 
 // @Summary Unbind Oauth2
