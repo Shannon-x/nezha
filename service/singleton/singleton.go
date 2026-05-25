@@ -38,6 +38,10 @@ var (
 	NotificationShared    *NotificationClass
 	NATShared             *NATClass
 	CronShared            *CronClass
+	// ServerTransferShared is initialized in LoadSingleton AFTER ServerShared
+	// (so the in-memory pending index can write back into ServerShared.UserID
+	// on transitions) and AFTER initUser (so PushIfOnline can read secrets
+	// from UserInfoMap).
 )
 
 //go:embed frontend-templates.yaml
@@ -63,6 +67,7 @@ func LoadSingleton(bus chan<- *model.Service) (err error) {
 	NotificationShared = NewNotificationClass()
 	ServerShared = NewServerClass()
 	CronShared = NewCronClass()
+	ServerTransferShared = NewServerTransferClass()
 	// 最后初始化 ServiceSentinel
 	ServiceSentinelShared, err = NewServiceSentinel(bus)
 	return
@@ -127,7 +132,7 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 		model.Notification{}, model.AlertRule{}, model.Service{}, model.NotificationGroupNotification{},
 		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
 		model.NAT{}, model.DDNSProfile{}, model.NotificationGroupNotification{},
-		model.WAF{}, model.Oauth2Bind{})
+		model.WAF{}, model.Oauth2Bind{}, model.ServerTransfer{})
 	if err != nil {
 		return fmt.Errorf("failed to auto-migrate database: %w", err)
 	}
