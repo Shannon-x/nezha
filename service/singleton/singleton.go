@@ -128,6 +128,20 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 	if Conf.Debug {
 		DB = DB.Debug()
 	}
+
+	// 网络型数据库设置连接池上限，避免无限制并发吃光 MySQL max_connections，
+	// 也防止空闲连接被服务端 wait_timeout 单边断开后 GORM 拿到 stale conn。
+	// SQLite 是单文件，没有"连接"概念，跳过。
+	if dbConfig.Type == model.DBTypeMySQL ||
+		dbConfig.Type == model.DBTypePostgres ||
+		dbConfig.Type == model.DBTypeSQLServer {
+		if sqlDB, e := DB.DB(); e == nil {
+			sqlDB.SetMaxOpenConns(50)
+			sqlDB.SetMaxIdleConns(10)
+			sqlDB.SetConnMaxLifetime(30 * time.Minute)
+			sqlDB.SetConnMaxIdleTime(5 * time.Minute)
+		}
+	}
 	err = DB.AutoMigrate(model.Server{}, model.User{}, model.ServerGroup{}, model.NotificationGroup{},
 		model.Notification{}, model.AlertRule{}, model.Service{}, model.NotificationGroupNotification{},
 		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
@@ -224,12 +238,12 @@ func CleanMonitorHistory() {
 		}
 	}
 	for id, couldRemove := range specialServerKeep {
-		DB.Unscoped().Delete(&model.Transfer{}, "server_id = ? AND datetime(`created_at`) < datetime(?)", id, couldRemove)
+		DB.Unscoped().Delete(&model.Transfer{}, "server_id = ? AND created_at < ?", id, couldRemove)
 	}
 	if allServerKeep.IsZero() {
 		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?)", specialServerIDs)
 	} else {
-		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?) AND datetime(`created_at`) < datetime(?)", specialServerIDs, allServerKeep)
+		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?) AND created_at < ?", specialServerIDs, allServerKeep)
 	}
 }
 

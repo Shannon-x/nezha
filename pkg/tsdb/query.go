@@ -224,6 +224,21 @@ func (db *TSDB) QueryServiceDailyStats(serviceID uint64, today time.Time, days i
 	return stats, nil
 }
 
+// QueryServicesDailyStats VM 后端的批量实现：VM 没有 SQL GROUP BY 等价物，
+// 此处退化为循环。VM 模式查询天然按 service_id 标签走 inverted index，
+// 单次查询本身已经较快，N 次循环对 VM 不构成 N+1 瓶颈。
+func (db *TSDB) QueryServicesDailyStats(serviceIDs []uint64, today time.Time, days int) (map[uint64][]DailyServiceStats, error) {
+	result := make(map[uint64][]DailyServiceStats, len(serviceIDs))
+	for _, sid := range serviceIDs {
+		stats, err := db.QueryServiceDailyStats(sid, today, days)
+		if err != nil {
+			return nil, err
+		}
+		result[sid] = stats
+	}
+	return result, nil
+}
+
 type metricPoint struct {
 	timestamp int64
 	value     float64

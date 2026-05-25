@@ -99,24 +99,48 @@ func CloseTSDB() {
 	}
 }
 
-// PerformMaintenance 执行系统维护（SQLite VACUUM 和 TSDB 维护）
+// PerformMaintenance 执行系统维护：按数据库方言收缩存储 + 触发 TSDB retention
+//
+// 关于不同数据库的压缩策略：
+//   - SQLite: VACUUM 重写整个文件，单进程独占
+//   - MySQL InnoDB: DELETE 不会归还 .ibd 文件空间，需要 OPTIMIZE TABLE（等价于
+//     ALTER TABLE ... FORCE）来重建表回收磁盘。Online DDL 5.6+ 允许并发 DML，
+//     但首次跑大表会持有 MDL 较长时间，请放在维护窗口。
+//   - PostgreSQL: VACUUM (ANALYZE) 不重写 relation，仅回收死元组到 freespace map；
+//     如需把磁盘归还 OS，需要人工跑 VACUUM FULL（持表锁），不在自动化范围。
+//   - SQLServer: DBCC SHRINKFILE 风险较高，留给 DBA 手工评估。
+var maintenanceTables = []string{"tsdb_service_metrics", "tsdb_server_metrics", "transfers"}
+
 func PerformMaintenance() {
 	log.Println("NEZHA>> Starting system maintenance...")
 
-	// 1. SQLite 维护
 	if DB != nil {
-		log.Println("NEZHA>> SQLite: Starting VACUUM...")
-		if err := DB.Exec("VACUUM").Error; err != nil {
-			log.Printf("NEZHA>> SQLite: VACUUM failed: %v", err)
-		} else {
-			log.Println("NEZHA>> SQLite: VACUUM completed")
+		switch Conf.Database.Type {
+		case model.DBTypeSQLite, "":
+			runMaintenanceSQL("SQLite VACUUM", "VACUUM")
+		case model.DBTypeMySQL:
+			for _, t := range maintenanceTables {
+				runMaintenanceSQL("MySQL OPTIMIZE "+t, "OPTIMIZE TABLE `"+t+"`")
+			}
+		case model.DBTypePostgres:
+			for _, t := range maintenanceTables {
+				runMaintenanceSQL("PG VACUUM "+t, "VACUUM (ANALYZE) "+t)
+			}
 		}
 	}
 
-	// 2. TSDB 维护
 	if TSDBEnabled() {
 		TSDBShared.Maintenance()
 	}
 
 	log.Println("NEZHA>> System maintenance completed")
+}
+
+func runMaintenanceSQL(label, sql string) {
+	log.Printf("NEZHA>> %s: starting...", label)
+	if err := DB.Exec(sql).Error; err != nil {
+		log.Printf("NEZHA>> %s: failed: %v", label, err)
+		return
+	}
+	log.Printf("NEZHA>> %s: completed", label)
 }

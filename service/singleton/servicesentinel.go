@@ -247,10 +247,21 @@ func (ss *ServiceSentinel) loadServiceHistory() error {
 }
 
 func (ss *ServiceSentinel) loadMonthlyStatusFromTSDB(services []*model.Service, today time.Time) {
+	if len(services) == 0 {
+		return
+	}
+	serviceIDs := make([]uint64, 0, len(services))
 	for _, service := range services {
-		dailyStats, err := TSDBShared.QueryServiceDailyStats(service.ID, today, 30)
-		if err != nil {
-			log.Printf("NEZHA>> Failed to load TSDB history for service %d: %v", service.ID, err)
+		serviceIDs = append(serviceIDs, service.ID)
+	}
+	dailyStatsMap, err := TSDBShared.QueryServicesDailyStats(serviceIDs, today, 30)
+	if err != nil {
+		log.Printf("NEZHA>> Failed to batch-load TSDB history for %d services: %v", len(serviceIDs), err)
+		return
+	}
+	for _, service := range services {
+		dailyStats, ok := dailyStatsMap[service.ID]
+		if !ok {
 			continue
 		}
 		ms := ss.monthlyStatus[service.ID]

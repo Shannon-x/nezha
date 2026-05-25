@@ -348,6 +348,70 @@ func (s *SQLStore) QueryServiceDailyStats(serviceID uint64, today time.Time, day
 	return stats, nil
 }
 
+// QueryServicesDailyStats 批量查询多个服务的每日统计，一次聚合 SQL 取回所有结果。
+//
+// 相比 N 次 QueryServiceDailyStats 调用，本方法的优势：
+//   - 数据库往返从 N 次降到 1 次（dashboard 启动期 N×~12s → 一次几秒）
+//   - 命中 idx_tsdb_svc_time (service_id, created_at) 复合索引，service_id IN (...) 走范围扫描
+//   - GROUP BY 在数据库侧聚合，Go 侧只做分桶映射
+func (s *SQLStore) QueryServicesDailyStats(serviceIDs []uint64, today time.Time, days int) (map[uint64][]DailyServiceStats, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, fmt.Errorf("SQLStore is closed")
+	}
+
+	result := make(map[uint64][]DailyServiceStats, len(serviceIDs))
+	for _, id := range serviceIDs {
+		result[id] = make([]DailyServiceStats, days)
+	}
+	if len(serviceIDs) == 0 {
+		return result, nil
+	}
+
+	start := today.AddDate(0, 0, -(days - 1))
+
+	type aggResult struct {
+		ServiceID uint64  `gorm:"column:service_id"`
+		Date      string  `gorm:"column:date"`
+		Up        uint64  `gorm:"column:up"`
+		Down      uint64  `gorm:"column:down"`
+		AvgDelay  float64 `gorm:"column:avg_delay"`
+	}
+
+	var results []aggResult
+	if err := s.db.Model(&TSDBServiceMetric{}).
+		Select("service_id, DATE(created_at) as date, SUM(CASE WHEN status >= 1 THEN 1 ELSE 0 END) as up, SUM(CASE WHEN status < 1 THEN 1 ELSE 0 END) as down, AVG(delay) as avg_delay").
+		Where("service_id IN ? AND created_at >= ? AND created_at < ?", serviceIDs, start, today).
+		Group("service_id, DATE(created_at)").
+		Find(&results).Error; err != nil {
+		return nil, err
+	}
+
+	for _, r := range results {
+		bucket, ok := result[r.ServiceID]
+		if !ok {
+			continue
+		}
+		if len(r.Date) < 10 {
+			continue
+		}
+		t, err := time.Parse("2006-01-02", r.Date[0:10])
+		if err != nil {
+			continue
+		}
+		dayIndex := (days - 1) - int(today.Sub(t).Hours())/24
+		if dayIndex < 0 || dayIndex >= days {
+			continue
+		}
+		bucket[dayIndex].Up = r.Up
+		bucket[dayIndex].Down = r.Down
+		bucket[dayIndex].Delay = r.AvgDelay
+	}
+
+	return result, nil
+}
+
 // QueryServerMetrics 查询服务器指标历史
 func (s *SQLStore) QueryServerMetrics(serverID uint64, metric MetricType, period QueryPeriod) ([]MetricDataPoint, error) {
 	s.mu.RLock()
