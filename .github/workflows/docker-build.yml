@@ -10,7 +10,9 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # GHCR requires the repository path to be lowercase; ${{ github.repository }}
+  # preserves the owner's casing (Shannon-x), so hardcode the lowercased form.
+  IMAGE_NAME: shannon-x/nezha
 
 jobs:
   build:
