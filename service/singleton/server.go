@@ -28,13 +28,12 @@ func NewServerClass() *ServerClass {
 		uuidToID: make(map[string]uint64),
 	}
 
-	var servers []model.Server
+	var servers []*model.Server
 	DB.Find(&servers)
 	for _, s := range servers {
-		innerS := s
-		model.InitServer(&innerS)
-		sc.list[innerS.ID] = &innerS
-		sc.uuidToID[innerS.UUID] = innerS.ID
+		model.InitServer(s)
+		sc.list[s.ID] = s
+		sc.uuidToID[s.UUID] = s.ID
 	}
 	sc.sortList()
 
