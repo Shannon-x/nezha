@@ -146,7 +146,7 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 		model.Notification{}, model.AlertRule{}, model.Service{}, model.NotificationGroupNotification{},
 		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
 		model.NAT{}, model.DDNSProfile{}, model.NotificationGroupNotification{},
-		model.WAF{}, model.Oauth2Bind{}, model.ServerTransfer{})
+		model.WAF{}, model.Oauth2Bind{}, model.ServerTransfer{}, model.JWTSession{})
 	if err != nil {
 		return fmt.Errorf("failed to auto-migrate database: %w", err)
 	}

@@ -24,6 +24,7 @@ import (
 	"github.com/nezhahq/nezha/cmd/dashboard/controller/waf"
 	"github.com/nezhahq/nezha/cmd/dashboard/rpc"
 	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/idcodec"
 	"github.com/nezhahq/nezha/pkg/utils"
 	"github.com/nezhahq/nezha/proto"
 	"github.com/nezhahq/nezha/service/singleton"
@@ -60,7 +61,6 @@ func initDatabase() error {
 }
 
 func initSystem(bus chan<- *model.Service) error {
-	// 初始化管理员账户
 	var usersCount int64
 	if err := singleton.DB.Model(&model.User{}).Count(&usersCount).Error; err != nil {
 		return err
@@ -79,7 +79,6 @@ func initSystem(bus chan<- *model.Service) error {
 		}
 	}
 
-	// 启动 singleton 包下的所有服务
 	if err := singleton.LoadSingleton(bus); err != nil {
 		return err
 	}
@@ -89,11 +88,18 @@ func initSystem(bus chan<- *model.Service) error {
 		return err
 	}
 
-	// 每小时对流量记录进行打点
 	if _, err := singleton.CronShared.AddFunc("0 0 * * * *", func() { singleton.RecordTransferHourlyUsage() }); err != nil {
 		return err
 	}
+
+	if err := singleton.StartJWTSessionGC(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func initIDCodec() error {
+	return idcodec.Init([]byte(singleton.Conf.JWTSecretKey))
 }
 
 // @title           Nezha Monitoring API
@@ -132,6 +138,7 @@ func main() {
 	// 初始化 dao 包
 	if err := utils.FirstError(singleton.InitFrontendTemplates,
 		func() error { return singleton.InitConfigFromPath(dashboardCliParam.ConfigFile) },
+		initIDCodec,
 		singleton.InitTimezoneAndCache,
 		func() error {
 			if singleton.Conf.Memory.GoMemLimitMB > 0 {
