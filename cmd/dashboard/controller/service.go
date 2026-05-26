@@ -142,14 +142,14 @@ func listServiceHistory(c *gin.Context) ([]*model.ServiceInfos, error) {
 
 	// 当 TSDB 启用时，从 TSDB 查询数据（tsdb_service_metrics 表）
 	if singleton.TSDBEnabled() {
-		return listServiceHistoryFromTSDB(id, m)
+		return listServiceHistoryFromTSDB(c, id, m)
 	}
 
 	// 回退到旧的 service_histories 表查询
-	return listServiceHistoryFromDB(id, m)
+	return listServiceHistoryFromDB(c, id, m)
 }
 
-func listServiceHistoryFromTSDB(serverID uint64, m map[uint64]*model.Server) ([]*model.ServiceInfos, error) {
+func listServiceHistoryFromTSDB(c *gin.Context, serverID uint64, m map[uint64]*model.Server) ([]*model.ServiceInfos, error) {
 	results, err := singleton.TSDBShared.QueryServiceHistoryByServerID(serverID, tsdb.Period1Day)
 	if err != nil {
 		return nil, err
@@ -160,6 +160,10 @@ func listServiceHistoryFromTSDB(serverID uint64, m map[uint64]*model.Server) ([]
 
 	for serviceID, histResult := range results {
 		service, _ := singleton.ServiceSentinelShared.Get(serviceID)
+		// GHSA-vrmh-5mmx-hjwx: 隐藏 EnableShowInService=false 的服务（除非调用者是 owner/admin）
+		if !userCanViewService(c, service) {
+			continue
+		}
 		serviceName := ""
 		if service != nil {
 			serviceName = service.Name
@@ -197,7 +201,7 @@ func listServiceHistoryFromTSDB(serverID uint64, m map[uint64]*model.Server) ([]
 	return ret, nil
 }
 
-func listServiceHistoryFromDB(serverID uint64, m map[uint64]*model.Server) ([]*model.ServiceInfos, error) {
+func listServiceHistoryFromDB(c *gin.Context, serverID uint64, m map[uint64]*model.Server) ([]*model.ServiceInfos, error) {
 	var serviceHistories []*model.ServiceHistory
 	if err := singleton.DB.Model(&model.ServiceHistory{}).Select("service_id, created_at, server_id, avg_delay").
 		Where("server_id = ?", serverID).Where("created_at >= ?", time.Now().Add(-24*time.Hour)).Order("service_id, created_at").
@@ -210,6 +214,10 @@ func listServiceHistoryFromDB(serverID uint64, m map[uint64]*model.Server) ([]*m
 	for _, history := range serviceHistories {
 		infos, ok := resultMap[history.ServiceID]
 		service, _ := singleton.ServiceSentinelShared.Get(history.ServiceID)
+		// GHSA-vrmh-5mmx-hjwx: 隐藏 EnableShowInService=false 的服务
+		if !userCanViewService(c, service) {
+			continue
+		}
 		if !ok {
 			infos = &model.ServiceInfos{
 				ServiceID:   history.ServiceID,
@@ -482,9 +490,8 @@ func getServiceHistory(c *gin.Context) (*model.ServiceHistoryResponse, error) {
 		return nil, err
 	}
 
-	// 检查服务是否存在
 	service, ok := singleton.ServiceSentinelShared.Get(serviceID)
-	if !ok || service == nil {
+	if !ok || service == nil || !userCanViewService(c, service) {
 		return nil, singleton.Localizer.ErrorT("service not found")
 	}
 
