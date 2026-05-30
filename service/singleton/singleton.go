@@ -146,13 +146,23 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 		model.Notification{}, model.AlertRule{}, model.Service{}, model.NotificationGroupNotification{},
 		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
 		model.NAT{}, model.DDNSProfile{}, model.NotificationGroupNotification{},
-		model.WAF{}, model.Oauth2Bind{}, model.ServerTransfer{}, model.JWTSession{})
+		model.WAF{}, model.Oauth2Bind{}, model.ServerTransfer{}, model.JWTSession{},
+		model.APIToken{}, model.MCPAuditLog{})
 	if err != nil {
 		return fmt.Errorf("failed to auto-migrate database: %w", err)
 	}
 
 	// 执行数据库迁移（处理容器升级时的类型转换等）
 	model.RunMigrations(DB, dbConfig.Type)
+
+	// 旧 mcp:* scope 与 nezha:* 并行了一段时间，HasScope 通过别名让 mcp:fs:write
+	// 静默扩到 REST nezha:server:write。统一命名后这里把残留旧 scope 一次性
+	// 归一化（或在仅剩危险旧 scope 时整张 PAT 删除），保证运行时不再依赖别名。
+	if rewritten, deleted, mErr := model.MigrateLegacyMCPScopes(DB); mErr != nil {
+		log.Printf("NEZHA>> MigrateLegacyMCPScopes failed: %v", mErr)
+	} else if rewritten > 0 || deleted > 0 {
+		log.Printf("NEZHA>> Migrated legacy mcp:* api token scopes: rewritten=%d deleted=%d", rewritten, deleted)
+	}
 
 	return nil
 }
