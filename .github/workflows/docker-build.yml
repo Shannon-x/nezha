@@ -45,7 +45,7 @@ jobs:
           rm admin-dist.zip
 
           echo "Downloading user-frontend..."
-          curl -L -o user-dist.zip https://github.com/hamster1963/nezha-dash-v1/releases/latest/download/dist.zip
+          curl -L -o user-dist.zip https://github.com/hamster1963/nezha-dash-v2/releases/latest/download/dist.zip
           unzip -q user-dist.zip -d cmd/dashboard/
           mv cmd/dashboard/dist cmd/dashboard/user-dist
           rm user-dist.zip
