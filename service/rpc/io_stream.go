@@ -48,13 +48,46 @@ var bufPool = sync.Pool{
 	},
 }
 
-func (s *NezhaHandler) CreateStream(streamId string, creatorUserID uint64, targetServerID uint64) {
-	s.CreateStreamWithPurpose(streamId, creatorUserID, targetServerID, PurposeLegacy)
+const (
+	maxStreamsPerUser   = 20
+	maxStreamsPerServer = 40
+)
+
+var (
+	ErrTooManyStreamsForUser   = errors.New("too many concurrent streams for this user")
+	ErrTooManyStreamsForServer = errors.New("too many concurrent streams for this server")
+)
+
+func (s *NezhaHandler) CreateStream(streamId string, creatorUserID uint64, targetServerID uint64) error {
+	return s.CreateStreamWithPurpose(streamId, creatorUserID, targetServerID, PurposeLegacy)
 }
 
-func (s *NezhaHandler) CreateStreamWithPurpose(streamId string, creatorUserID uint64, targetServerID uint64, purpose StreamPurpose) {
+func (s *NezhaHandler) CreateStreamWithPurpose(streamId string, creatorUserID uint64, targetServerID uint64, purpose StreamPurpose) error {
 	s.ioStreamMutex.Lock()
 	defer s.ioStreamMutex.Unlock()
+
+	// GHSA-jg62-j5h6-8mpq：terminal/file-manager 之前无上限地创建 IO 流，任一
+	// 已认证成员可开成千上万条，每条都占用 goroutine、1MiB 缓冲与 agent 侧 PTY，
+	// 耗尽 dashboard 与 agent 资源。以现有 ioStreamMutex 临界区内的 stream map
+	// 为唯一真相，按用户(20)与服务器(40)双重限流。
+	var perUser, perServer int
+	for _, ctx := range s.ioStreams {
+		if creatorUserID != 0 && ctx.creatorUserID == creatorUserID {
+			perUser++
+		}
+		if ctx.targetServerID == targetServerID {
+			perServer++
+		}
+	}
+	// creatorUserID==0 为 dashboard 内部流（NAT、服务器迁移、MCP transfer），
+	// 只豁免按用户限流；但每条流仍计入按服务器限流，使任何来源都无法淹没某台
+	// 服务器。
+	if creatorUserID != 0 && perUser >= maxStreamsPerUser {
+		return ErrTooManyStreamsForUser
+	}
+	if perServer >= maxStreamsPerServer {
+		return ErrTooManyStreamsForServer
+	}
 
 	s.ioStreams[streamId] = &ioStreamContext{
 		creatorUserID:    creatorUserID,
@@ -64,6 +97,7 @@ func (s *NezhaHandler) CreateStreamWithPurpose(streamId string, creatorUserID ui
 		agentIoConnectCh: make(chan struct{}),
 		revokedCh:        make(chan struct{}),
 	}
+	return nil
 }
 
 // IsStreamAuthorizedForAgent reports whether the connecting agent is the
