@@ -42,7 +42,7 @@ jobs:
           # 用 latest 会让纯后端改动在重建时悄悄带入新前端版本（曾导致用户前端滚动
           # 回归），且使镜像不可复现。升级前端时同时改这里与 frontend-templates.yaml。
           ADMIN_VERSION="v2.1.1"
-          USER_VERSION="v2.0.4"
+          USER_VERSION="v2.1.2"
 
           echo "Downloading admin-frontend ${ADMIN_VERSION}..."
           curl -fL -o admin-dist.zip "https://github.com/nezhahq/admin-frontend/releases/download/${ADMIN_VERSION}/dist.zip"
