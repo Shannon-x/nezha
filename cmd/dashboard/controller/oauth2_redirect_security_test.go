@@ -49,11 +49,13 @@ func TestGetRedirectURL_ForgedHostPinnedToDashboardHost(t *testing.T) {
 		"伪造 Host 必须被忽略，回调锁定到 DashboardHost")
 }
 
-func TestGetRedirectURL_ForgedHostFallsBackToInstallHostWhenDashboardHostEmpty(t *testing.T) {
+func TestGetRedirectURL_EmptyDashboardHostPassesThroughRequestHost(t *testing.T) {
+	// DashboardHost 为空时透传请求 Host（兼容反代/CF 隧道部署：对外域名只在请求
+	// Host 里，绝不能改写成 InstallHost 这类 agent 连接地址，否则破坏 OIDC 回调校验）。
 	setRedirectHostConf(t, "", "install.example.com", "")
-	got := getRedirectURL(redirectCtx("evil.attacker.com", false))
-	require.Equal(t, "http://install.example.com/api/v1/oauth2/callback", got,
-		"未配置 DashboardHost 时，伪造 Host 应回退到 InstallHost（强于上游默认的透传）")
+	got := getRedirectURL(redirectCtx("dash.tunnel.example.com", false))
+	require.Equal(t, "http://dash.tunnel.example.com/api/v1/oauth2/callback", got,
+		"未配置 DashboardHost 时必须透传请求 Host，与 InstallHost 解耦")
 }
 
 func TestGetRedirectURL_TrustsReservedDashboardHostVerbatim(t *testing.T) {
