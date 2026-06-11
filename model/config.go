@@ -114,6 +114,11 @@ type ConfigDashboard struct {
 	InstallHost string `koanf:"install_host" json:"install_host,omitempty"`
 	AgentTLS    bool   `koanf:"tls" json:"tls,omitempty"` // 用于前端判断生成的安装命令是否启用 TLS
 
+	// DashboardHost 是 dashboard 对外访问的主机名，专用于 OAuth2 回调地址，与
+	// InstallHost（agent 连接用主机名）解耦：两者可以是不同域名。为空时 OAuth2
+	// 回调回退到 InstallHost（见 getRedirectURL）。它同样纳入保留 host 白名单。
+	DashboardHost string `koanf:"dashboard_host" json:"dashboard_host,omitempty"`
+
 	WebRealIPHeader   string `koanf:"web_real_ip_header" json:"web_real_ip_header,omitempty"`     // 前端真实IP
 	AgentRealIPHeader string `koanf:"agent_real_ip_header" json:"agent_real_ip_header,omitempty"` // Agent真实IP
 	UserTemplate      string `koanf:"user_template" json:"user_template,omitempty"`

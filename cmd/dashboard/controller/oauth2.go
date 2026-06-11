@@ -19,13 +19,27 @@ import (
 	"github.com/nezhahq/nezha/service/singleton"
 )
 
+// GHSA-9rc6-8cjv-rcvx：OAuth2 回调 URL 会发给身份提供方，授权码最终落在这个
+// 地址。若直接用原始 Host 头构造，攻击者用伪造 Host（或遇到 redirect-URI 宽松
+// 匹配的提供方）即可把受害者的授权码导向自己的源、绑定其身份。仅当请求 Host 是
+// 运维声明的 dashboard host（与 NAT 路由同一份 IsReservedDashboardHost 白名单）
+// 时才信任它；否则优先锁定到运维声明的 DashboardHost，其次回退 InstallHost，使
+// 伪造 Host 无法操纵回调源。仅当两者都未配置时才透传请求 Host。
 func getRedirectURL(c *gin.Context) string {
 	scheme := "http://"
 	referer := c.Request.Referer()
 	if forwardedProto := c.Request.Header.Get("X-Forwarded-Proto"); forwardedProto == "https" || strings.HasPrefix(referer, "https://") {
 		scheme = "https://"
 	}
-	return scheme + c.Request.Host + "/api/v1/oauth2/callback"
+	host := c.Request.Host
+	if !singleton.IsReservedDashboardHost(host) && singleton.Conf != nil {
+		if singleton.Conf.DashboardHost != "" {
+			host = singleton.Conf.DashboardHost
+		} else if singleton.Conf.InstallHost != "" {
+			host = singleton.Conf.InstallHost
+		}
+	}
+	return scheme + host + "/api/v1/oauth2/callback"
 }
 
 // @Summary Get Oauth2 Redirect URL
