@@ -38,14 +38,20 @@ jobs:
 
       - name: Download frontend resources
         run: |
-          echo "Downloading admin-frontend..."
-          curl -L -o admin-dist.zip https://github.com/nezhahq/admin-frontend/releases/latest/download/dist.zip
+          # 固定到 service/singleton/frontend-templates.yaml 声明的版本，而非 latest。
+          # 用 latest 会让纯后端改动在重建时悄悄带入新前端版本（曾导致用户前端滚动
+          # 回归），且使镜像不可复现。升级前端时同时改这里与 frontend-templates.yaml。
+          ADMIN_VERSION="v2.1.1"
+          USER_VERSION="v2.0.4"
+
+          echo "Downloading admin-frontend ${ADMIN_VERSION}..."
+          curl -fL -o admin-dist.zip "https://github.com/nezhahq/admin-frontend/releases/download/${ADMIN_VERSION}/dist.zip"
           unzip -q admin-dist.zip -d cmd/dashboard/
           mv cmd/dashboard/dist cmd/dashboard/admin-dist
           rm admin-dist.zip
 
-          echo "Downloading user-frontend..."
-          curl -L -o user-dist.zip https://github.com/hamster1963/nezha-dash-v2/releases/latest/download/dist.zip
+          echo "Downloading user-frontend ${USER_VERSION}..."
+          curl -fL -o user-dist.zip "https://github.com/hamster1963/nezha-dash-v2/releases/download/${USER_VERSION}/dist.zip"
           unzip -q user-dist.zip -d cmd/dashboard/
           mv cmd/dashboard/dist cmd/dashboard/user-dist
           rm user-dist.zip
