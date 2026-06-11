@@ -166,6 +166,13 @@ func (r *AlertRule) Check(points [][]bool) (int, bool) {
 			continue
 		} else {
 			// 常规报警
+			// duration<=0 是无意义的规则（持续 0 秒）：直接跳过该规则，既不污染
+			// hasPassedRule（否则会连带跳过同一 alert 里其它有效规则），也避免下方
+			// fail*100/total 在 total=0 时整数除零 panic —— checkStatus 无 recover，
+			// 一次 panic 会拖垮整个告警 goroutine（配置可达的 DoS）。
+			if duration <= 0 {
+				continue
+			}
 			if hasPassedRule = boundCheck(len(points), duration, hasPassedRule); hasPassedRule {
 				continue
 			}
@@ -187,6 +194,31 @@ func (r *AlertRule) Check(points [][]bool) (int, bool) {
 
 	// 仅当所有检查均未通过时 才触发告警
 	return slices.Max(durations), hasPassedRule
+}
+
+// RetentionWindow 返回保留历史采样所需的长度（各规则窗口的最大值），只依赖规则
+// 定义而非 Check 的判定结果。各规则类型回看的采样数必须与 Check 中实际读取的窗口
+// 一致：
+//   - 周期流量规则：Check 只读最后 1 个采样点 → 需要 1
+//   - 离线规则、常规规则：Check 读取 points[len-Duration:] → 需要 Duration
+//
+// window==0 表示该 alert 没有任何会回看历史的有效规则（例如全部 Duration<=0 被
+// 跳过），调用方据此清空采样，避免切片每个 tick 只 append 而永不裁剪导致的内存
+// 无限增长（配置可达的内存耗尽 DoS）。
+func (r *AlertRule) RetentionWindow() int {
+	window := 0
+	for _, rule := range r.Rules {
+		var need int
+		if rule.IsTransferDurationRule() {
+			need = 1
+		} else if d := int(rule.Duration); d > 0 {
+			need = d
+		}
+		if need > window {
+			window = need
+		}
+	}
+	return window
 }
 
 func boundCheck(length, duration int, passed bool) bool {
