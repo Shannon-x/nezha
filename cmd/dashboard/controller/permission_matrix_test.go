@@ -262,7 +262,11 @@ func TestShowServiceFiltersCycleTransferStatsLikeServerList(t *testing.T) {
 	singleton.ServerShared = singleton.NewServerClass()
 
 	assert.NoError(t, singleton.DB.Create(&model.Service{Common: model.Common{ID: 10, UserID: 1}, Name: "shown service", EnableShowInService: true}).Error)
-	assert.NoError(t, singleton.DB.Create(&model.Service{Common: model.Common{ID: 11, UserID: 1}, Name: "hidden service"}).Error)
+	hiddenService := &model.Service{Common: model.Common{ID: 11, UserID: 1}, Name: "hidden service"}
+	assert.NoError(t, singleton.DB.Create(hiddenService).Error)
+	// EnableShowInService 带 gorm:"default: true"，结构体里的零值 false 在 INSERT 时会被
+	// 默认值覆盖成 true；必须显式落库为 false，服务 11 才是真正"隐藏"。
+	assert.NoError(t, singleton.DB.Model(hiddenService).Update("enable_show_in_service", false).Error)
 
 	originalServiceSentinel := singleton.ServiceSentinelShared
 	serviceSentinel, err := singleton.NewServiceSentinel(make(chan *model.Service, 2))
@@ -288,23 +292,27 @@ func TestShowServiceFiltersCycleTransferStatsLikeServerList(t *testing.T) {
 	})
 
 	tests := []struct {
-		name      string
-		viewer    *model.User
-		wantNames map[uint64]string
+		name         string
+		viewer       *model.User
+		wantServices []uint64
+		wantNames    map[uint64]string
 	}{
 		{
-			name:      "guest sees public servers only",
-			wantNames: map[uint64]string{1: "public server"},
+			name:         "guest sees public servers only",
+			wantServices: []uint64{10},
+			wantNames:    map[uint64]string{1: "public server"},
 		},
 		{
-			name:      "member sees public and owned hidden servers",
-			viewer:    &model.User{Common: model.Common{ID: 200}, Role: model.RoleMember},
-			wantNames: map[uint64]string{1: "public server", 3: "hidden member server"},
+			name:         "member sees public and owned hidden servers",
+			viewer:       &model.User{Common: model.Common{ID: 200}, Role: model.RoleMember},
+			wantServices: []uint64{10},
+			wantNames:    map[uint64]string{1: "public server", 3: "hidden member server"},
 		},
 		{
-			name:      "admin sees every server",
-			viewer:    &model.User{Common: model.Common{ID: 1}, Role: model.RoleAdmin},
-			wantNames: map[uint64]string{1: "public server", 2: "hidden admin server", 3: "hidden member server"},
+			name:         "admin sees every server",
+			viewer:       &model.User{Common: model.Common{ID: 1}, Role: model.RoleAdmin},
+			wantServices: []uint64{10, 11},
+			wantNames:    map[uint64]string{1: "public server", 2: "hidden admin server", 3: "hidden member server"},
 		},
 	}
 
@@ -317,8 +325,7 @@ func TestShowServiceFiltersCycleTransferStatsLikeServerList(t *testing.T) {
 
 			got, err := showService(ctx)
 			assert.NoError(t, err)
-			assert.Contains(t, got.Services, uint64(10))
-			assert.NotContains(t, got.Services, uint64(11))
+			assert.ElementsMatch(t, tc.wantServices, serviceResponseIDs(got.Services))
 			if assert.Contains(t, got.CycleTransferStats, uint64(7)) {
 				cycleStats := got.CycleTransferStats[7]
 				assert.Equal(t, tc.wantNames, cycleStats.ServerName)
@@ -333,6 +340,14 @@ func TestShowServiceFiltersCycleTransferStatsLikeServerList(t *testing.T) {
 			}
 		})
 	}
+}
+
+func serviceResponseIDs(stats map[uint64]model.ServiceResponseItem) []uint64 {
+	ids := make([]uint64, 0, len(stats))
+	for id := range stats {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func decodeIDs[T ~uint64](t *testing.T, body []byte) []T {

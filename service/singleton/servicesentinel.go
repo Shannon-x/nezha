@@ -447,13 +447,11 @@ func (ss *ServiceSentinel) CopyStats() map[uint64]model.ServiceResponseItem {
 	var stats map[uint64]*serviceResponseItem
 	copier.Copy(&stats, ss.LoadStats())
 
+	// 不再在此按 EnableShowInService 一刀切过滤：按查看者权限的收窄已移到
+	// controller.filterServiceStatsForViewer（属主/管理员可见隐藏服务，游客只见公开），
+	// 与服务器列表的可见性一致。CopyStats 返回全部统计副本。
 	sri := make(map[uint64]model.ServiceResponseItem)
 	for k, service := range stats {
-		if !service.service.EnableShowInService {
-			delete(stats, k)
-			continue
-		}
-
 		service.ServiceName = service.service.Name
 		sri[k] = service.ServiceResponseItem
 	}

@@ -30,7 +30,7 @@ func showService(c *gin.Context) (*model.ServiceResponse, error) {
 	res, err, _ := requestGroup.Do(serviceResponseCacheKey(c), func() (any, error) {
 		singleton.AlertsLock.RLock()
 		defer singleton.AlertsLock.RUnlock()
-		stats := singleton.ServiceSentinelShared.CopyStats()
+		stats := filterServiceStatsForViewer(c, singleton.ServiceSentinelShared.CopyStats())
 		var cycleTransferStats map[uint64]model.CycleTransferStats
 		copier.Copy(&cycleTransferStats, singleton.AlertsCycleTransferStatsStore)
 		return []any{
@@ -45,6 +45,26 @@ func showService(c *gin.Context) (*model.ServiceResponse, error) {
 		Services:           res.([]any)[0].(map[uint64]model.ServiceResponseItem),
 		CycleTransferStats: res.([]any)[1].(map[uint64]model.CycleTransferStats),
 	}, nil
+}
+
+// filterServiceStatsForViewer 按查看者权限过滤服务统计：CopyStats 现在返回全部服务
+// 的统计，由此处按 userCanViewService 收窄——公开服务(EnableShowInService)对所有人
+// 可见，隐藏服务仅其属主/管理员可见。与 filterCycleTransferStatsForViewer 对齐，避免
+// 隐藏服务的统计泄露给无权查看者。
+func filterServiceStatsForViewer(c *gin.Context, stats map[uint64]model.ServiceResponseItem) map[uint64]model.ServiceResponseItem {
+	if len(stats) == 0 {
+		return stats
+	}
+	services := singleton.ServiceSentinelShared.GetList()
+	filteredStats := make(map[uint64]model.ServiceResponseItem, len(stats))
+	for serviceID, stat := range stats {
+		service, ok := services[serviceID]
+		if !ok || !userCanViewService(c, service) {
+			continue
+		}
+		filteredStats[serviceID] = stat
+	}
+	return filteredStats
 }
 
 func serviceResponseCacheKey(c *gin.Context) string {
