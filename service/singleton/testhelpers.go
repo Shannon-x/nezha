@@ -38,11 +38,13 @@ func NewEmptyDDNSClassForTest() *DDNSClass {
 	}
 }
 
-// InsertForTest 把一个 DDNS profile 直接塞进内存表，跳过 DB。
+// InsertForTest 把一个 DDNS profile 直接塞进内存表与排序快照，跳过 DB。
+// 必须同时刷新 sortedList，否则 GetSortedList（listDDNS 依赖它）读到空快照。
 func (c *DDNSClass) InsertForTest(p *model.DDNSProfile) {
 	c.listMu.Lock()
 	c.list[p.ID] = p
 	c.listMu.Unlock()
+	c.sortList()
 }
 
 // NewEmptyNotificationClassForTest 构造空 NotificationClass。
@@ -57,9 +59,11 @@ func NewEmptyNotificationClassForTest() *NotificationClass {
 	}
 }
 
-// InsertForTest 把一个 Notification 直接塞进内存表。
+// InsertForTest 把一个 Notification 直接塞进内存表与排序快照。必须同时刷新
+// sortedList，否则 GetSortedList（listNotification 依赖它）读到空快照。
 func (c *NotificationClass) InsertForTest(n *model.Notification) {
 	c.listMu.Lock()
 	c.list[n.ID] = n
 	c.listMu.Unlock()
+	c.sortList()
 }
