@@ -38,23 +38,16 @@ jobs:
 
       - name: Download frontend resources
         run: |
-          # 固定到 service/singleton/frontend-templates.yaml 声明的版本，而非 latest。
-          # 用 latest 会让纯后端改动在重建时悄悄带入新前端版本（曾导致用户前端滚动
-          # 回归），且使镜像不可复现。升级前端时同时改这里与 frontend-templates.yaml。
-          ADMIN_VERSION="v2.1.1"
-          USER_VERSION="v2.1.2"
-
-          echo "Downloading admin-frontend ${ADMIN_VERSION}..."
-          curl -fL -o admin-dist.zip "https://github.com/nezhahq/admin-frontend/releases/download/${ADMIN_VERSION}/dist.zip"
-          unzip -q admin-dist.zip -d cmd/dashboard/
-          mv cmd/dashboard/dist cmd/dashboard/admin-dist
-          rm admin-dist.zip
-
-          echo "Downloading user-frontend ${USER_VERSION}..."
-          curl -fL -o user-dist.zip "https://github.com/hamster1963/nezha-dash-v2/releases/download/${USER_VERSION}/dist.zip"
-          unzip -q user-dist.zip -d cmd/dashboard/
-          mv cmd/dashboard/dist cmd/dashboard/user-dist
-          rm user-dist.zip
+          # 前端版本以 service/singleton/frontend-templates.yaml 为单一真相：里面 pin 了
+          # 每个前端（admin/user + nazhua/aobobo/nezha-ascii 主题）的确切 tag，可复现、
+          # 不追 latest（避免纯后端改动重建时悄悄带入新前端）。fetch-frontends.sh 逐个下载
+          # 对应 dist.zip 到 cmd/dashboard/*-dist，再由 //go:embed *-dist 编入二进制。
+          # 升级/增删前端只改那个 yaml 即可，无需动本工作流。
+          ARCH="$(dpkg --print-architecture)"
+          sudo wget -qO /usr/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${ARCH}"
+          sudo chmod +x /usr/bin/yq
+          chmod +x ./script/fetch-frontends.sh
+          ./script/fetch-frontends.sh
 
       - name: Fetch IPInfo GeoIP Database
         env:
