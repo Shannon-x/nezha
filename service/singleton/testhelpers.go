@@ -20,6 +20,9 @@ func NewEmptyServerClassForTest() *ServerClass {
 // InsertForTest 把一个 server 直接塞进内存表与排序快照，跳过 DB & InitServer 逻辑。
 // 调用方需保证 server.ID 已经设置。
 func (c *ServerClass) InsertForTest(s *model.Server) {
+	c.lockLifecycleWrite()
+	defer c.unlockLifecycleWrite()
+
 	c.listMu.Lock()
 	c.list[s.ID] = s
 	if s.UUID != "" {
@@ -38,8 +41,7 @@ func NewEmptyDDNSClassForTest() *DDNSClass {
 	}
 }
 
-// InsertForTest 把一个 DDNS profile 直接塞进内存表与排序快照，跳过 DB。
-// 必须同时刷新 sortedList，否则 GetSortedList（listDDNS 依赖它）读到空快照。
+// InsertForTest 把一个 DDNS profile 直接塞进内存表，跳过 DB。
 func (c *DDNSClass) InsertForTest(p *model.DDNSProfile) {
 	c.listMu.Lock()
 	c.list[p.ID] = p
@@ -59,8 +61,7 @@ func NewEmptyNotificationClassForTest() *NotificationClass {
 	}
 }
 
-// InsertForTest 把一个 Notification 直接塞进内存表与排序快照。必须同时刷新
-// sortedList，否则 GetSortedList（listNotification 依赖它）读到空快照。
+// InsertForTest 把一个 Notification 直接塞进内存表。
 func (c *NotificationClass) InsertForTest(n *model.Notification) {
 	c.listMu.Lock()
 	c.list[n.ID] = n

@@ -57,6 +57,9 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	if err := authMiddleware.MiddlewareInit(); err != nil {
 		log.Fatal("authMiddleware.MiddlewareInit Error:" + err.Error())
 	}
+	// Signature-only view of the auth middleware for IsDashboardCredential:
+	// same key and pinned algorithm, claims validation deliberately skipped.
+	dashboardCredentialJWTParser = newDashboardCredentialJWTParser(authMiddleware)
 	// /mcp — Model Context Protocol endpoint, authenticated by PAT only (闸 1 + 闸 2)。
 	// 不放在 /api/v1 下：MCP client 配置 URL 更短，且 MCP transport 协议演进与 REST API
 	// 解耦。鉴权一律走 apiTokenAuthMiddleware；不接受 JWT 以避免浏览器误触。
@@ -69,6 +72,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	r.DELETE("/mcp", mcpOriginGuard(), mcpMethodNotAllowed)
 	r.GET("/mcp/download/:token", mcpOriginGuard(), transferDownloadHandler)
 	r.POST("/mcp/upload/:token", mcpOriginGuard(), transferUploadHandler)
+	registerAgentcompatRoutes(r)
 
 	api := r.Group("api/v1")
 	api.POST("/login", authMiddleware.LoginHandler)
@@ -94,10 +98,10 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	optionalAuth.GET("/service", restScopeMiddleware(model.ScopeServiceRead), commonHandler(showService))
 	optionalAuth.GET("/service/server", restScopeMiddleware(model.ScopeServiceRead), commonHandler(listServerWithServices))
 	optionalAuth.GET("/service/:id/history", restScopeMiddleware(model.ScopeServiceRead), commonHandler(getServiceHistory))
-	// 本地路由：/service/:id 列出服务器维度的服务历史（前端用），/server/:id/service 是
-	// 老脚本（如 xiaoxingxing.js）的兼容入口。两者复用 listServiceHistory 实现。
-	optionalAuth.GET("/service/:id", restScopeMiddleware(model.ScopeServiceRead), commonHandler(listServiceHistory))
-	optionalAuth.GET("/server/:id/service", restScopeMiddleware(model.ScopeServiceRead), commonHandler(listServiceHistory))
+	optionalAuth.GET("/server/:id/service", restScopeMiddleware(model.ScopeServiceRead), commonHandler(listServerServices))
+	// 兼容路由：旧前端与老脚本（如 xiaoxingxing.js）用 /service/:id（:id 为服务器 ID）
+	// 拉取服务器维度的服务历史，与 /server/:id/service 复用同一实现。
+	optionalAuth.GET("/service/:id", restScopeMiddleware(model.ScopeServiceRead), commonHandler(listServerServices))
 	optionalAuth.GET("/server/:id/metrics", restScopeMiddleware(model.ScopeServerRead), commonHandler(getServerMetrics))
 
 	// CSRF middleware applies group-wide. Safe methods short-circuit and
@@ -191,7 +195,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.GET("/online-user", restScopeMiddleware(model.ScopeAdminAll), pAdminHandler(listOnlineUser))
 	auth.POST("/online-user/batch-block", restScopeMiddleware(model.ScopeAdminAll), adminHandler(batchBlockOnlineUser))
 	auth.PATCH("/setting", restScopeMiddleware(model.ScopeAdminAll), adminHandler(updateConfig))
-	auth.POST("/maintenance", restScopeMiddleware(model.ScopeAdminAll), adminHandler(performMaintenance))
+	auth.POST("/maintenance", restScopeMiddleware(model.ScopeAdminAll), adminHandler(runMaintenance))
 
 	r.NoRoute(fallbackToFrontend(frontendDist))
 }

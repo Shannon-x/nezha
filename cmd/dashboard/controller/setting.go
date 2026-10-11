@@ -97,6 +97,9 @@ func updateConfig(c *gin.Context) (any, error) {
 
 	singleton.Conf.EnableIPChangeNotification = sf.EnableIPChangeNotification
 	singleton.Conf.EnablePlainIPInNotification = sf.EnablePlainIPInNotification
+	if sf.AllowJWTIPChange != nil {
+		singleton.Conf.SetJWTIPChangeAllowed(*sf.AllowJWTIPChange)
+	}
 	singleton.Conf.Cover = sf.Cover
 	singleton.Conf.InstallHost = sf.InstallHost
 	singleton.Conf.DashboardHost = sf.DashboardHost
@@ -160,6 +163,12 @@ func fireMCPKillSwitch() {
 // the current config to avoid accidentally tripping the kill switch on
 // partial PATCH calls that omit enable_mcp.
 func resolveSettingEnableMCP(formValue *bool, current bool) bool {
+	return resolveOptionalBool(formValue, current)
+}
+
+// resolveOptionalBool preserves a setting for partial PATCH requests when its
+// boolean field is absent, while still allowing an explicit false value.
+func resolveOptionalBool(formValue *bool, current bool) bool {
 	if formValue == nil {
 		return current
 	}
@@ -167,7 +176,7 @@ func resolveSettingEnableMCP(formValue *bool, current bool) bool {
 }
 
 // Perform maintenance
-// @Summary Perform system maintenance
+// @Summary Perform maintenance
 // @Security BearerAuth
 // @Schemes
 // @Description Perform system maintenance (SQLite VACUUM and TSDB maintenance)
@@ -175,7 +184,8 @@ func resolveSettingEnableMCP(formValue *bool, current bool) bool {
 // @Produce json
 // @Success 200 {object} model.CommonResponse[any]
 // @Router /maintenance [post]
-func performMaintenance(c *gin.Context) (any, error) {
+func runMaintenance(c *gin.Context) (any, error) {
+	// 异步执行：大库上的 VACUUM / TSDB 维护可能耗时数分钟，同步执行会让请求超时。
 	go singleton.PerformMaintenance()
 	return nil, nil
 }

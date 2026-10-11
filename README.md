@@ -7,6 +7,9 @@
 <img alt="GitHub release (with filter)" src="https://img.shields.io/github/v/release/nezhahq/nezha?color=brightgreen&style=for-the-badge&logo=github&label=Dashboard">&nbsp;<img src="https://img.shields.io/github/v/release/nezhahq/agent?color=brightgreen&label=Agent&style=for-the-badge&logo=github">&nbsp;<img src="https://img.shields.io/github/actions/workflow/status/nezhahq/agent/agent.yml?label=Agent%20CI&logo=github&style=for-the-badge">&nbsp;<a href="https://hosted.weblate.org/engage/nezha/"><img src="https://img.shields.io/weblate/progress/nezha?color=brightgreen&label=Translated&style=for-the-badge&logo=weblate" alt="Translation status" /></a>
   <br>
   <br>
+  <a href="https://trendshift.io/repositories/12344?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-12344" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/12344" alt="nezhahq%2Fnezha | Trendshift" width="250" height="55"/></a>
+  <br>
+  <br>
   <p>:trollface: <b>Nezha Monitoring: Self-hostable, lightweight, servers and websites monitoring and O&M tool.</b></p>
   <p>Supports <b>monitoring</b> system status, HTTP (SSL certificate change, upcoming expiration, expired), TCP, Ping and supports <b>push alerts</b>, run scheduled tasks and <b>web terminal</b>.</p>
 </div>
@@ -17,6 +20,9 @@
 \>> [Use Cases | 我们的用户](https://www.google.com/search?q=%22%E5%93%AA%E5%90%92%E7%9B%91%E6%8E%A7+Nezha+Monitoring%22) (Google) <br>
 <sub>\>> Telegram Group: [Nezha Monitoring Global (English Only)](https://t.me/nezhamonitoring_global), [哪吒监控（中文群组）](https://t.me/nezhamonitoring)</sub>
 
+## Sponsors / 赞助商
+
+> 🤝 Sponsorship slot available / 赞助位待认领
 
 ## User Guide
 
@@ -130,6 +136,7 @@ add your theme to [service/singleton/frontend-templates.yaml](service/singleton/
 <a href="https://github.com/MikoyChinese" title="MikoyChinese"><img src="https://avatars.githubusercontent.com/u/22676744?v=4" width="50;" alt="MikoyChinese"/></a>
 <a href="https://github.com/weblate" title="Weblate (bot)"><img src="https://avatars.githubusercontent.com/u/1607653?v=4" width="50;" alt="Weblate (bot)"/></a>
 <a href="https://github.com/JackieSung4ev" title="JackieSung4ev"><img src="https://avatars.githubusercontent.com/u/24974735?v=4" width="50;" alt="JackieSung4ev"/></a>
+<a href="https://github.com/77-QiQi" title="77-QiQi"><img src="https://avatars.githubusercontent.com/u/87052253?v=4" width="50;" alt="77-QiQi"/></a>
 <a href="https://github.com/cantoblanco" title="Kris"><img src="https://avatars.githubusercontent.com/u/116849421?v=4" width="50;" alt="Kris"/></a>
 <a href="https://github.com/lemoeo" title="Lemoe"><img src="https://avatars.githubusercontent.com/u/18618627?v=4" width="50;" alt="Lemoe"/></a>
 <a href="https://github.com/spiritLHLS" title="spiritlhl"><img src="https://avatars.githubusercontent.com/u/103393591?v=4" width="50;" alt="spiritlhl"/></a>
@@ -140,8 +147,8 @@ add your theme to [service/singleton/frontend-templates.yaml](service/singleton/
 <a href="https://github.com/Mmx233" title="Mmx233"><img src="https://avatars.githubusercontent.com/u/36563672?v=4" width="50;" alt="Mmx233"/></a>
 <a href="https://github.com/rootmelo92118" title="rootmelo92118"><img src="https://avatars.githubusercontent.com/u/32770959?v=4" width="50;" alt="rootmelo92118"/></a>
 <a href="https://github.com/Moraxyc" title="Moraxyc Xu"><img src="https://avatars.githubusercontent.com/u/69713071?v=4" width="50;" alt="Moraxyc Xu"/></a>
-<a href="https://github.com/1ridic" title="1ridic"><img src="https://avatars.githubusercontent.com/u/88495501?v=4" width="50;" alt="1ridic"/></a>
 <a href="https://github.com/hamster1963" title="仓鼠"><img src="https://avatars.githubusercontent.com/u/71394853?v=4" width="50;" alt="仓鼠"/></a>
+<a href="https://github.com/1ridic" title="1ridic"><img src="https://avatars.githubusercontent.com/u/88495501?v=4" width="50;" alt="1ridic"/></a>
 <a href="https://github.com/zhucaidan" title="zhucaidan"><img src="https://avatars.githubusercontent.com/u/47970938?v=4" width="50;" alt="zhucaidan"/></a>
 <a href="https://github.com/iilemon" title="Sean"><img src="https://avatars.githubusercontent.com/u/33201711?v=4" width="50;" alt="Sean"/></a>
 <a href="https://github.com/lyj0309" title="lyj"><img src="https://avatars.githubusercontent.com/u/50474995?v=4" width="50;" alt="lyj"/></a>
@@ -152,41 +159,48 @@ add your theme to [service/singleton/frontend-templates.yaml](service/singleton/
 <a href="https://github.com/DarcJC" title="Darc Z."><img src="https://avatars.githubusercontent.com/u/53445798?v=4" width="50;" alt="Darc Z."/></a>
 <a href="https://github.com/Creling" title="Creling"><img src="https://avatars.githubusercontent.com/u/43109504?v=4" width="50;" alt="Creling"/></a>
 <a href="https://github.com/coreff" title="Core F"><img src="https://avatars.githubusercontent.com/u/38347122?v=4" width="50;" alt="Core F"/></a>
-<a href="https://github.com/adminsama" title="adminsama"><img src="https://avatars.githubusercontent.com/u/60880076?v=4" width="50;" alt="adminsama"/></a>
+<a href="https://github.com/NikoCat233" title="NikoCat233"><img src="https://avatars.githubusercontent.com/u/139348239?v=4" width="50;" alt="NikoCat233"/></a>
+<a href="https://github.com/wellcoming" title="Coming Wel"><img src="https://avatars.githubusercontent.com/u/74850890?v=4" width="50;" alt="Coming Wel"/></a>
 <a href="https://github.com/acgpiano" title="Acgpiano"><img src="https://avatars.githubusercontent.com/u/15900800?v=4" width="50;" alt="Acgpiano"/></a>
 <a href="https://github.com/eya46" title="eya46"><img src="https://avatars.githubusercontent.com/u/61458340?v=4" width="50;" alt="eya46"/></a>
 <a href="https://github.com/guoyongchang" title="guoyongchang"><img src="https://avatars.githubusercontent.com/u/10484506?v=4" width="50;" alt="guoyongchang"/></a>
-<a href="https://github.com/hiDandelion" title="hiDandelion"><img src="https://avatars.githubusercontent.com/u/77157418?v=4" width="50;" alt="hiDandelion"/></a>
+<a href="https://github.com/hiDandelion" title="霧島拓真"><img src="https://avatars.githubusercontent.com/u/77157418?v=4" width="50;" alt="霧島拓真"/></a>
 <a href="https://github.com/honeok" title="honeok"><img src="https://avatars.githubusercontent.com/u/100125733?v=4" width="50;" alt="honeok"/></a>
 <a href="https://github.com/yuanweize" title="IYUANWEIZE"><img src="https://avatars.githubusercontent.com/u/30067203?v=4" width="50;" alt="IYUANWEIZE"/></a>
 <a href="https://github.com/igophper" title="igophper"><img src="https://avatars.githubusercontent.com/u/34326532?v=4" width="50;" alt="igophper"/></a>
 <a href="https://github.com/lvyaoting" title="lvyaoting"><img src="https://avatars.githubusercontent.com/u/166296299?v=4" width="50;" alt="lvyaoting"/></a>
 <a href="https://github.com/quanljh" title="quanljh"><img src="https://avatars.githubusercontent.com/u/38105306?v=4" width="50;" alt="quanljh"/></a>
 <a href="https://github.com/unclezs" title="unclezs"><img src="https://avatars.githubusercontent.com/u/42318775?v=4" width="50;" alt="unclezs"/></a>
+<a href="https://github.com/xvkong233" title="虚空"><img src="https://avatars.githubusercontent.com/u/88175491?v=4" width="50;" alt="虚空"/></a>
 <a href="https://github.com/ysicing" title="缘生"><img src="https://avatars.githubusercontent.com/u/8605565?v=4" width="50;" alt="缘生"/></a>
 <a href="https://github.com/yanhao98" title="严浩"><img src="https://avatars.githubusercontent.com/u/37316281?v=4" width="50;" alt="严浩"/></a>
 <a href="https://github.com/arkylin" title="凌"><img src="https://avatars.githubusercontent.com/u/35104502?v=4" width="50;" alt="凌"/></a>
 <a href="https://github.com/yumusb" title="榆木"><img src="https://avatars.githubusercontent.com/u/43062104?v=4" width="50;" alt="榆木"/></a>
 <a href="https://github.com/colour93" title="93"><img src="https://avatars.githubusercontent.com/u/64313711?v=4" width="50;" alt="93"/></a>
-<a href="https://github.com/hmsjy2017" title="Tony"><img src="https://avatars.githubusercontent.com/u/42692274?v=4" width="50;" alt="Tony"/></a>
-<a href="https://github.com/TomyJan" title="TomyJan"><img src="https://avatars.githubusercontent.com/u/67973160?v=4" width="50;" alt="TomyJan"/></a>
-<a href="https://github.com/nickfox-taterli" title="Tater Li"><img src="https://avatars.githubusercontent.com/u/19658596?v=4" width="50;" alt="Tater Li"/></a>
-<a href="https://github.com/IamTaoChen" title="Tao Chen"><img src="https://avatars.githubusercontent.com/u/42793494?v=4" width="50;" alt="Tao Chen"/></a>
-<a href="https://github.com/Septrum101" title="Spetrum"><img src="https://avatars.githubusercontent.com/u/11692994?v=4" width="50;" alt="Spetrum"/></a>
-<a href="https://github.com/dreamingsleeping" title="Nanjing Hopefun Network Technology Co. Ltd."><img src="https://avatars.githubusercontent.com/u/13828658?v=4" width="50;" alt="Nanjing Hopefun Network Technology Co. Ltd."/></a>
-<a href="https://github.com/silver-ymz" title="Mingzhuo Yin"><img src="https://avatars.githubusercontent.com/u/78400701?v=4" width="50;" alt="Mingzhuo Yin"/></a>
-<a href="https://github.com/MartijnLindeman" title="Martijn Lindeman"><img src="https://avatars.githubusercontent.com/u/78365708?v=4" width="50;" alt="Martijn Lindeman"/></a>
-<a href="https://github.com/funnyzak" title="Leon"><img src="https://avatars.githubusercontent.com/u/2562087?v=4" width="50;" alt="Leon"/></a>
-<a href="https://github.com/KorenKrita" title="KorenKrita"><img src="https://avatars.githubusercontent.com/u/22239339?v=4" width="50;" alt="KorenKrita"/></a>
-<a href="https://github.com/techotaku" title="Ian Li"><img src="https://avatars.githubusercontent.com/u/1948179?v=4" width="50;" alt="Ian Li"/></a>
-<a href="https://github.com/GreenTeodoro839" title="YiPing Zhang"><img src="https://avatars.githubusercontent.com/u/77104800?v=4" width="50;" alt="YiPing Zhang"/></a>
-<a href="https://github.com/Es-dese" title="Esdese"><img src="https://avatars.githubusercontent.com/u/71542548?v=4" width="50;" alt="Esdese"/></a>
 <a href="https://github.com/wwng2333" title=":D"><img src="https://avatars.githubusercontent.com/u/17147265?v=4" width="50;" alt=":D"/></a>
-<a href="https://github.com/wellcoming" title="Coming"><img src="https://avatars.githubusercontent.com/u/74850890?v=4" width="50;" alt="Coming"/></a><!--GAMFC_DELIMITER_END-->
+<a href="https://github.com/Es-dese" title="Esdese"><img src="https://avatars.githubusercontent.com/u/71542548?v=4" width="50;" alt="Esdese"/></a>
+<a href="https://github.com/GreenTeodoro839" title="GreenTeodoro839"><img src="https://avatars.githubusercontent.com/u/77104800?v=4" width="50;" alt="GreenTeodoro839"/></a>
+<a href="https://github.com/techotaku" title="Ian Li"><img src="https://avatars.githubusercontent.com/u/1948179?v=4" width="50;" alt="Ian Li"/></a>
+<a href="https://github.com/KorenKrita" title="KorenKrita"><img src="https://avatars.githubusercontent.com/u/22239339?v=4" width="50;" alt="KorenKrita"/></a>
+<a href="https://github.com/funnyzak" title="Leon"><img src="https://avatars.githubusercontent.com/u/2562087?v=4" width="50;" alt="Leon"/></a>
+<a href="https://github.com/MartijnLindeman" title="Martijn Lindeman"><img src="https://avatars.githubusercontent.com/u/78365708?v=4" width="50;" alt="Martijn Lindeman"/></a>
+<a href="https://github.com/silver-ymz" title="Mingzhuo Yin"><img src="https://avatars.githubusercontent.com/u/78400701?v=4" width="50;" alt="Mingzhuo Yin"/></a>
+<a href="https://github.com/dreamingsleeping" title="Nanjing Hopefun Network Technology Co. Ltd."><img src="https://avatars.githubusercontent.com/u/13828658?v=4" width="50;" alt="Nanjing Hopefun Network Technology Co. Ltd."/></a>
+<a href="https://github.com/Septrum101" title="Spetrum"><img src="https://avatars.githubusercontent.com/u/11692994?v=4" width="50;" alt="Spetrum"/></a>
+<a href="https://github.com/IamTaoChen" title="Tao Chen"><img src="https://avatars.githubusercontent.com/u/42793494?v=4" width="50;" alt="Tao Chen"/></a>
+<a href="https://github.com/nickfox-taterli" title="Tater Li"><img src="https://avatars.githubusercontent.com/u/19658596?v=4" width="50;" alt="Tater Li"/></a>
+<a href="https://github.com/TomyJan" title="TomyJan"><img src="https://avatars.githubusercontent.com/u/67973160?v=4" width="50;" alt="TomyJan"/></a>
+<a href="https://github.com/hmsjy2017" title="Tony"><img src="https://avatars.githubusercontent.com/u/42692274?v=4" width="50;" alt="Tony"/></a>
+<a href="https://github.com/ace-consultoria" title="ace-consultoria"><img src="https://avatars.githubusercontent.com/u/263983342?v=4" width="50;" alt="ace-consultoria"/></a>
+<a href="https://github.com/adminsama" title="adminsama"><img src="https://avatars.githubusercontent.com/u/60880076?v=4" width="50;" alt="adminsama"/></a>
+<a href="https://github.com/railzen" title="Chra"><img src="https://avatars.githubusercontent.com/u/48409318?v=4" width="50;" alt="Chra"/></a>
+<a href="https://github.com/Mubelotix" title="Mubelotix"><img src="https://avatars.githubusercontent.com/u/42696684?v=4" width="50;" alt="Mubelotix"/></a>
+<a href="https://github.com/ryrenz" title="Ryrenz"><img src="https://avatars.githubusercontent.com/u/163799701?v=4" width="50;" alt="Ryrenz"/></a>
+<a href="https://github.com/zhdsmy" title="zhdsmy"><img src="https://avatars.githubusercontent.com/u/8348149?v=4" width="50;" alt="zhdsmy"/></a><!--GAMFC_DELIMITER_END-->
 
 ## Special Thanks
 - [IPInfo](https://ipinfo.io/) for providing an accurate GeoIP Database.
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=nezhahq/nezha&type=Timeline)](https://star-history.com/#nezhahq/nezha&Timeline)
+[![Star History Chart](https://star-history.dera.page/svg?repos=nezhahq/nezha&type=Timeline)](https://star-history.dera.page/#nezhahq/nezha&Timeline)

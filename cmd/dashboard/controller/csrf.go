@@ -72,9 +72,10 @@ func setCSRFCookie(c *gin.Context) {
 	if token == "" {
 		return
 	}
-	// Secure 仅在请求经由 HTTPS 时设置，与 writeOauth2StateCookie 保持一致。
-	// 纯 HTTP（如内网部署）下浏览器会丢弃 Secure cookie，破坏双提交配对，
-	// 故不能无条件强制（CodeQL go/cookie-secure-not-set, CWE-614）。
+	// Secure is set only when the request arrives over HTTPS, mirroring
+	// writeOauth2StateCookie. On plain HTTP (e.g. intranet deployments) a
+	// Secure cookie would be dropped by the browser, breaking the
+	// double-submit pair, so we must not force it unconditionally.
 	secure := c.Request.URL.Scheme == "https" || c.Request.TLS != nil
 	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie(csrfCookieName, token, 0, "/", "", secure, false)

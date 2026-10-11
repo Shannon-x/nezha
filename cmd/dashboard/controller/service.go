@@ -9,12 +9,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/copier"
+	"gorm.io/gorm"
 
 	"github.com/nezhahq/nezha/model"
 	"github.com/nezhahq/nezha/pkg/tsdb"
 	"github.com/nezhahq/nezha/pkg/utils"
 	"github.com/nezhahq/nezha/service/singleton"
-	"gorm.io/gorm"
 )
 
 // Show service
@@ -47,10 +47,6 @@ func showService(c *gin.Context) (*model.ServiceResponse, error) {
 	}, nil
 }
 
-// filterServiceStatsForViewer 按查看者权限过滤服务统计：CopyStats 现在返回全部服务
-// 的统计，由此处按 userCanViewService 收窄——公开服务(EnableShowInService)对所有人
-// 可见，隐藏服务仅其属主/管理员可见。与 filterCycleTransferStatsForViewer 对齐，避免
-// 隐藏服务的统计泄露给无权查看者。
 func filterServiceStatsForViewer(c *gin.Context, stats map[uint64]model.ServiceResponseItem) map[uint64]model.ServiceResponseItem {
 	if len(stats) == 0 {
 		return stats
@@ -132,7 +128,7 @@ func filterServerMapForViewer[T any](c *gin.Context, values map[uint64]T, server
 // @Param id query uint false "Resource ID"
 // @Produce json
 // @Success 200 {object} model.CommonResponse[[]model.Service]
-// @Router /service [get]
+// @Router /service/list [get]
 func listService(c *gin.Context) ([]*model.Service, error) {
 	var ss []*model.Service
 	ssl := singleton.ServiceSentinelShared.GetSortedList()
@@ -141,372 +137,6 @@ func listService(c *gin.Context) ([]*model.Service, error) {
 	}
 
 	return ss, nil
-}
-
-// List service histories by server id
-// @Summary List service histories by server id
-// @Security BearerAuth
-// @Schemes
-// @Description List service histories by server id
-// @Tags common
-// @param id path uint true "Server ID"
-// @Produce json
-// @Success 200 {object} model.CommonResponse[[]model.ServiceInfos]
-// @Router /service/{id} [get]
-func listServiceHistory(c *gin.Context) ([]*model.ServiceInfos, error) {
-	idStr := c.Param("id")
-	id, err := strconv.ParseUint(idStr, 10, 64)
-	if err != nil {
-		return nil, err
-	}
-
-	m := singleton.ServerShared.GetList()
-	server, ok := m[id]
-	if !ok || server == nil {
-		return nil, singleton.Localizer.ErrorT("server not found")
-	}
-
-	if !userCanViewServer(c, server) {
-		return nil, singleton.Localizer.ErrorT("unauthorized")
-	}
-
-	// 当 TSDB 启用时，从 TSDB 查询数据（tsdb_service_metrics 表）
-	if singleton.TSDBEnabled() {
-		return listServiceHistoryFromTSDB(c, id, m)
-	}
-
-	// 回退到旧的 service_histories 表查询
-	return listServiceHistoryFromDB(c, id, m)
-}
-
-func listServiceHistoryFromTSDB(c *gin.Context, serverID uint64, m map[uint64]*model.Server) ([]*model.ServiceInfos, error) {
-	results, err := singleton.TSDBShared.QueryServiceHistoryByServerID(serverID, tsdb.Period1Day)
-	if err != nil {
-		return nil, err
-	}
-
-	var sortedServiceIDs []uint64
-	resultMap := make(map[uint64]*model.ServiceInfos)
-
-	for serviceID, histResult := range results {
-		service, _ := singleton.ServiceSentinelShared.Get(serviceID)
-		// GHSA-vrmh-5mmx-hjwx: 隐藏 EnableShowInService=false 的服务（除非调用者是 owner/admin）
-		if !userCanViewService(c, service) {
-			continue
-		}
-		serviceName := ""
-		if service != nil {
-			serviceName = service.Name
-		}
-		serverName := ""
-		if srv, ok := m[serverID]; ok {
-			serverName = srv.Name
-		}
-
-		infos := &model.ServiceInfos{
-			ServiceID:   serviceID,
-			ServerID:    serverID,
-			ServiceName: serviceName,
-			ServerName:  serverName,
-		}
-
-		// 将 TSDB 的 DataPoints 转换为旧 API 的 CreatedAt + AvgDelay 格式
-		if len(histResult.Servers) > 0 {
-			stats := histResult.Servers[0].Stats
-			for _, dp := range stats.DataPoints {
-				infos.CreatedAt = append(infos.CreatedAt, dp.Timestamp)
-				infos.AvgDelay = append(infos.AvgDelay, dp.Delay)
-			}
-		}
-
-		resultMap[serviceID] = infos
-		sortedServiceIDs = append(sortedServiceIDs, serviceID)
-	}
-
-	ret := make([]*model.ServiceInfos, 0, len(sortedServiceIDs))
-	for _, id := range sortedServiceIDs {
-		ret = append(ret, resultMap[id])
-	}
-
-	return ret, nil
-}
-
-func listServiceHistoryFromDB(c *gin.Context, serverID uint64, m map[uint64]*model.Server) ([]*model.ServiceInfos, error) {
-	var serviceHistories []*model.ServiceHistory
-	if err := singleton.DB.Model(&model.ServiceHistory{}).Select("service_id, created_at, server_id, avg_delay").
-		Where("server_id = ?", serverID).Where("created_at >= ?", time.Now().Add(-24*time.Hour)).Order("service_id, created_at").
-		Scan(&serviceHistories).Error; err != nil {
-		return nil, err
-	}
-
-	var sortedServiceIDs []uint64
-	resultMap := make(map[uint64]*model.ServiceInfos)
-	for _, history := range serviceHistories {
-		infos, ok := resultMap[history.ServiceID]
-		service, _ := singleton.ServiceSentinelShared.Get(history.ServiceID)
-		// GHSA-vrmh-5mmx-hjwx: 隐藏 EnableShowInService=false 的服务
-		if !userCanViewService(c, service) {
-			continue
-		}
-		if !ok {
-			infos = &model.ServiceInfos{
-				ServiceID:   history.ServiceID,
-				ServerID:    history.ServerID,
-				ServiceName: service.Name,
-				ServerName:  m[history.ServerID].Name,
-			}
-			resultMap[history.ServiceID] = infos
-			sortedServiceIDs = append(sortedServiceIDs, history.ServiceID)
-		}
-		infos.CreatedAt = append(infos.CreatedAt, history.CreatedAt.Truncate(time.Minute).Unix()*1000)
-		infos.AvgDelay = append(infos.AvgDelay, history.AvgDelay)
-	}
-
-	ret := make([]*model.ServiceInfos, 0, len(sortedServiceIDs))
-	for _, id := range sortedServiceIDs {
-		ret = append(ret, resultMap[id])
-	}
-
-	return ret, nil
-}
-
-// List server with service
-// @Summary List server with service
-// @Security BearerAuth
-// @Schemes
-// @Description List server with service
-// @Tags common
-// @Produce json
-// @Success 200 {object} model.CommonResponse[[]uint64]
-// @Router /service/server [get]
-func listServerWithServices(c *gin.Context) ([]uint64, error) {
-	var serverIdsWithService []uint64
-	if err := singleton.DB.Model(&model.ServiceHistory{}).
-		Select("distinct(server_id)").
-		Where("server_id != 0").
-		Find(&serverIdsWithService).Error; err != nil {
-		return nil, newGormError("%v", err)
-	}
-
-	var ret []uint64
-	for _, id := range serverIdsWithService {
-		server, ok := singleton.ServerShared.Get(id)
-		if !ok || server == nil {
-			return nil, singleton.Localizer.ErrorT("server not found")
-		}
-		if userCanViewServer(c, server) {
-			ret = append(ret, id)
-		}
-	}
-
-	return ret, nil
-}
-
-// Create service
-// @Summary Create service
-// @Security BearerAuth
-// @Schemes
-// @Description Create service
-// @Tags auth required
-// @Accept json
-// @param request body model.ServiceForm true "Service Request"
-// @Produce json
-// @Success 200 {object} model.CommonResponse[uint64]
-// @Router /service [post]
-func createService(c *gin.Context) (uint64, error) {
-	var mf model.ServiceForm
-	if err := c.ShouldBindJSON(&mf); err != nil {
-		return 0, err
-	}
-
-	uid := getUid(c)
-
-	var m model.Service
-	m.UserID = uid
-	m.Name = mf.Name
-	m.Target = strings.TrimSpace(mf.Target)
-	m.Type = mf.Type
-	m.SkipServers = mf.SkipServers
-	m.Cover = mf.Cover
-	m.DisplayIndex = mf.DisplayIndex
-	m.Notify = mf.Notify
-	m.NotificationGroupID = mf.NotificationGroupID
-	m.Duration = mf.Duration
-	m.LatencyNotify = mf.LatencyNotify
-	m.MinLatency = mf.MinLatency
-	m.MaxLatency = mf.MaxLatency
-	m.EnableShowInService = mf.EnableShowInService
-	m.EnableTriggerTask = mf.EnableTriggerTask
-	m.RecoverTriggerTasks = mf.RecoverTriggerTasks
-	m.FailTriggerTasks = mf.FailTriggerTasks
-
-	if err := validateServers(c, &m); err != nil {
-		return 0, err
-	}
-
-	if err := singleton.DB.Create(&m).Error; err != nil {
-		return 0, newGormError("%v", err)
-	}
-
-	var skipServers []uint64
-	for k := range m.SkipServers {
-		skipServers = append(skipServers, k)
-	}
-
-	var err error
-	if m.Cover == 0 {
-		err = singleton.DB.Unscoped().Delete(&model.ServiceHistory{}, "service_id = ? and server_id in (?)", m.ID, skipServers).Error
-	} else {
-		err = singleton.DB.Unscoped().Delete(&model.ServiceHistory{}, "service_id = ? and server_id not in (?)", m.ID, skipServers).Error
-	}
-	if err != nil {
-		return 0, err
-	}
-
-	if err := singleton.ServiceSentinelShared.Update(&m); err != nil {
-		return 0, err
-	}
-
-	singleton.ServiceSentinelShared.UpdateServiceList()
-	return m.ID, nil
-}
-
-// Update service
-// @Summary Update service
-// @Security BearerAuth
-// @Schemes
-// @Description Update service
-// @Tags auth required
-// @Accept json
-// @param id path uint true "Service ID"
-// @param request body model.ServiceForm true "Service Request"
-// @Produce json
-// @Success 200 {object} model.CommonResponse[any]
-// @Router /service/{id} [patch]
-func updateService(c *gin.Context) (any, error) {
-	strID := c.Param("id")
-	id, err := strconv.ParseUint(strID, 10, 64)
-	if err != nil {
-		return nil, err
-	}
-	var mf model.ServiceForm
-	if err := c.ShouldBindJSON(&mf); err != nil {
-		return nil, err
-	}
-	var m model.Service
-	if err := singleton.DB.First(&m, id).Error; err != nil {
-		return nil, singleton.Localizer.ErrorT("service id %d does not exist", id)
-	}
-
-	if !m.HasPermission(c) {
-		return nil, singleton.Localizer.ErrorT("permission denied")
-	}
-
-	m.Name = mf.Name
-	m.Target = strings.TrimSpace(mf.Target)
-	m.Type = mf.Type
-	m.SkipServers = mf.SkipServers
-	m.Cover = mf.Cover
-	m.DisplayIndex = mf.DisplayIndex
-	m.Notify = mf.Notify
-	m.NotificationGroupID = mf.NotificationGroupID
-	m.Duration = mf.Duration
-	m.LatencyNotify = mf.LatencyNotify
-	m.MinLatency = mf.MinLatency
-	m.MaxLatency = mf.MaxLatency
-	m.EnableShowInService = mf.EnableShowInService
-	m.EnableTriggerTask = mf.EnableTriggerTask
-	m.RecoverTriggerTasks = mf.RecoverTriggerTasks
-	m.FailTriggerTasks = mf.FailTriggerTasks
-
-	if err := validateServers(c, &m); err != nil {
-		return 0, err
-	}
-
-	if err := singleton.DB.Save(&m).Error; err != nil {
-		return nil, newGormError("%v", err)
-	}
-
-	skipServers := utils.MapKeysToSlice(mf.SkipServers)
-
-	if m.Cover == model.ServiceCoverAll {
-		err = singleton.DB.Unscoped().Delete(&model.ServiceHistory{}, "service_id = ? and server_id in (?)", m.ID, skipServers).Error
-	} else {
-		err = singleton.DB.Unscoped().Delete(&model.ServiceHistory{}, "service_id = ? and server_id not in (?) and server_id > 0", m.ID, skipServers).Error
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	if err := singleton.ServiceSentinelShared.Update(&m); err != nil {
-		return nil, err
-	}
-
-	singleton.ServiceSentinelShared.UpdateServiceList()
-	return nil, nil
-}
-
-// Batch delete service
-// @Summary Batch delete service
-// @Security BearerAuth
-// @Schemes
-// @Description Batch delete service
-// @Tags auth required
-// @Accept json
-// @param request body []uint true "id list"
-// @Produce json
-// @Success 200 {object} model.CommonResponse[any]
-// @Router /batch-delete/service [post]
-func batchDeleteService(c *gin.Context) (any, error) {
-	var ids []uint64
-	if err := c.ShouldBindJSON(&ids); err != nil {
-		return nil, err
-	}
-
-	if !singleton.ServiceSentinelShared.CheckPermission(c, slices.Values(ids)) {
-		return nil, singleton.Localizer.ErrorT("permission denied")
-	}
-
-	err := singleton.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Unscoped().Delete(&model.Service{}, "id in (?)", ids).Error; err != nil {
-			return err
-		}
-		return tx.Unscoped().Delete(&model.ServiceHistory{}, "service_id in (?)", ids).Error
-	})
-	if err != nil {
-		return nil, err
-	}
-	singleton.ServiceSentinelShared.Delete(ids)
-	singleton.ServiceSentinelShared.UpdateServiceList()
-	return nil, nil
-}
-
-func validateServers(c *gin.Context, ss *model.Service) error {
-	if err := checkServiceSkipServerPermission(c, ss.Cover, ss.SkipServers, ss.GetUserID()); err != nil {
-		return err
-	}
-
-	if err := rejectImplicitServiceCoverForLimitedPAT(c, ss.Cover, ss.SkipServers, ss.GetUserID()); err != nil {
-		return err
-	}
-
-	// Trigger task IDs are user-controlled; validate them here so services cannot
-	// reference another user's cron and later execute it from the sentinel path.
-	if !singleton.CronShared.CheckPermission(c, slices.Values(ss.FailTriggerTasks)) {
-		return singleton.Localizer.ErrorT("permission denied")
-	}
-	if !singleton.CronShared.CheckPermission(c, slices.Values(ss.RecoverTriggerTasks)) {
-		return singleton.Localizer.ErrorT("permission denied")
-	}
-	if err := enforcePATTriggerTaskScope(c, ss.FailTriggerTasks, ss.RecoverTriggerTasks); err != nil {
-		return err
-	}
-
-	if err := assertOwnsNotificationGroup(c, ss.NotificationGroupID); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // Get service history
@@ -604,64 +234,62 @@ func queryServiceHistoryFromDB(c *gin.Context, serviceID uint64, period tsdb.Que
 		var totalDelay float64
 		var totalUp, totalDown uint64
 		dps := make([]model.DataPoint, 0, len(records))
-
 		for _, r := range records {
-			totalDelay += r.AvgDelay
-			totalUp += r.Up
-			totalDown += r.Down
-			var status uint8
-			if r.Up > r.Down {
-				status = 1
+			status := uint8(1)
+			if r.Down > 0 && r.Up == 0 {
+				status = 0
 			}
 			dps = append(dps, model.DataPoint{
-				Timestamp: r.CreatedAt.UnixMilli(),
+				Timestamp: r.CreatedAt.Unix() * 1000,
 				Delay:     r.AvgDelay,
 				Status:    status,
 			})
+			totalDelay += r.AvgDelay
+			totalUp += r.Up
+			totalDown += r.Down
 		}
 
-		stats.Stats = model.ServiceHistorySummary{
-			TotalUp:   totalUp,
-			TotalDown: totalDown,
-		}
+		var avgDelay float64
 		if len(records) > 0 {
-			stats.Stats.AvgDelay = totalDelay / float64(len(records))
+			avgDelay = totalDelay / float64(len(records))
 		}
+		var upPercent float32
 		if totalUp+totalDown > 0 {
-			stats.Stats.UpPercent = float32(totalUp) / float32(totalUp+totalDown) * 100
+			upPercent = float32(totalUp) / float32(totalUp+totalDown) * 100
 		}
-		stats.Stats.DataPoints = dps
-
+		stats.Stats = model.ServiceHistorySummary{
+			AvgDelay:   avgDelay,
+			UpPercent:  upPercent,
+			TotalUp:    totalUp,
+			TotalDown:  totalDown,
+			DataPoints: dps,
+		}
 		response.Servers = append(response.Servers, stats)
 	}
 
 	return response, nil
 }
 
-// Get server metrics
-// @Summary Get server metrics by server ID
+// List server services
+// @Summary List service histories by server id
 // @Security BearerAuth
 // @Schemes
-// @Description Get server metrics history for a specific server
+// @Description List service histories for a specific server
 // @Tags common
 // @param id path uint true "Server ID"
-// @param metric query string true "Metric name (e.g. nezha_server_cpu, nezha_server_memory)"
 // @param period query string false "Time period: 1d, 7d, 30d (default: 1d)"
 // @Produce json
-// @Success 200 {object} model.CommonResponse[model.ServerMetricsResponse]
-// @Router /server/{id}/metrics [get]
-func getServerMetrics(c *gin.Context) (*model.ServerMetricsResponse, error) {
-	if !singleton.TSDBEnabled() {
-		return nil, singleton.Localizer.ErrorT("TSDB is not enabled")
-	}
-
+// @Success 200 {object} model.CommonResponse[[]model.ServiceInfos]
+// @Router /server/{id}/service [get]
+func listServerServices(c *gin.Context) ([]*model.ServiceInfos, error) {
 	idStr := c.Param("id")
 	serverID, err := strconv.ParseUint(idStr, 10, 64)
 	if err != nil {
 		return nil, err
 	}
 
-	server, ok := singleton.ServerShared.Get(serverID)
+	m := singleton.ServerShared.GetList()
+	server, ok := m[serverID]
 	if !ok || server == nil {
 		return nil, singleton.Localizer.ErrorT("server not found")
 	}
@@ -669,34 +297,392 @@ func getServerMetrics(c *gin.Context) (*model.ServerMetricsResponse, error) {
 	if !userCanViewServer(c, server) {
 		return nil, singleton.Localizer.ErrorT("unauthorized")
 	}
+	_, isMember := c.Get(model.CtxKeyAuthorizedUser)
 
-	metricStr := c.Query("metric")
-	if metricStr == "" {
-		return nil, singleton.Localizer.ErrorT("metric is required")
-	}
-	metric := tsdb.MetricType(metricStr)
-
+	// 解析时间范围
 	periodStr := c.DefaultQuery("period", "1d")
 	period, err := tsdb.ParseQueryPeriod(periodStr)
 	if err != nil {
 		return nil, err
 	}
 
-	// 权限检查
-	_, isMember := c.Get(model.CtxKeyAuthorizedUser)
+	// 权限检查：未登录用户只能查看 1d 数据
 	if !isMember && period != tsdb.Period1Day {
 		return nil, singleton.Localizer.ErrorT("unauthorized: only 1d data available for guests")
 	}
 
-	dataPoints, err := singleton.TSDBShared.QueryServerMetrics(serverID, metric, period)
+	allServices := singleton.ServiceSentinelShared.GetSortedList()
+	services := make([]*model.Service, 0, len(allServices))
+	for _, s := range allServices {
+		if userCanViewService(c, s) {
+			services = append(services, s)
+		}
+	}
+
+	var result []*model.ServiceInfos
+
+	if !singleton.TSDBEnabled() {
+		return queryServerServicesFromDB(serverID, server.Name, period, services)
+	}
+
+	historyResults, err := singleton.TSDBShared.QueryServiceHistoryByServerID(serverID, period)
 	if err != nil {
 		return nil, err
 	}
 
-	return &model.ServerMetricsResponse{
-		ServerID:   serverID,
-		ServerName: server.Name,
-		Metric:     metricStr,
-		DataPoints: dataPoints,
-	}, nil
+	for _, service := range services {
+		if service.Cover == model.ServiceCoverAll {
+			if service.SkipServers[serverID] {
+				continue
+			}
+		} else {
+			if !service.SkipServers[serverID] {
+				continue
+			}
+		}
+
+		historyResult, ok := historyResults[service.ID]
+		if !ok || len(historyResult.Servers) == 0 {
+			continue
+		}
+
+		serverStats := historyResult.Servers[0]
+
+		infos := &model.ServiceInfos{
+			ServiceID:    service.ID,
+			ServerID:     serverID,
+			ServiceName:  service.Name,
+			ServerName:   server.Name,
+			DisplayIndex: service.DisplayIndex,
+			CreatedAt:    make([]int64, len(serverStats.Stats.DataPoints)),
+			AvgDelay:     make([]float64, len(serverStats.Stats.DataPoints)),
+		}
+
+		for i, dp := range serverStats.Stats.DataPoints {
+			infos.CreatedAt[i] = dp.Timestamp
+			infos.AvgDelay[i] = dp.Delay
+		}
+
+		result = append(result, infos)
+	}
+
+	return result, nil
+}
+
+func queryServerServicesFromDB(serverID uint64, serverName string, period tsdb.QueryPeriod, services []*model.Service) ([]*model.ServiceInfos, error) {
+	since := time.Now().Add(-period.Duration())
+
+	var histories []model.ServiceHistory
+	if err := singleton.DB.Where("server_id = ? AND created_at >= ?", serverID, since).
+		Order("service_id, created_at").Find(&histories).Error; err != nil {
+		return nil, err
+	}
+
+	grouped := make(map[uint64][]model.ServiceHistory)
+	for _, h := range histories {
+		grouped[h.ServiceID] = append(grouped[h.ServiceID], h)
+	}
+
+	var result []*model.ServiceInfos
+	for _, service := range services {
+		if service.Cover == model.ServiceCoverAll {
+			if service.SkipServers[serverID] {
+				continue
+			}
+		} else {
+			if !service.SkipServers[serverID] {
+				continue
+			}
+		}
+
+		records, ok := grouped[service.ID]
+		if !ok {
+			continue
+		}
+
+		infos := &model.ServiceInfos{
+			ServiceID:    service.ID,
+			ServerID:     serverID,
+			ServiceName:  service.Name,
+			ServerName:   serverName,
+			DisplayIndex: service.DisplayIndex,
+			CreatedAt:    make([]int64, 0, len(records)),
+			AvgDelay:     make([]float64, 0, len(records)),
+		}
+
+		for _, r := range records {
+			infos.CreatedAt = append(infos.CreatedAt, r.CreatedAt.Truncate(time.Minute).Unix()*1000)
+			infos.AvgDelay = append(infos.AvgDelay, r.AvgDelay)
+		}
+
+		result = append(result, infos)
+	}
+
+	return result, nil
+}
+
+// List server with service
+// @Summary List server with service
+// @Security BearerAuth
+// @Schemes
+// @Description List servers that have service monitoring data
+// @Tags common
+// @Produce json
+// @Success 200 {object} model.CommonResponse[[]uint64]
+// @Router /service/server [get]
+func listServerWithServices(c *gin.Context) ([]uint64, error) {
+	// 从内存中获取有服务监控配置的服务器列表
+	services := singleton.ServiceSentinelShared.GetList()
+	serverMap := singleton.ServerShared.GetList()
+
+	serverIDSet := make(map[uint64]bool)
+
+	for _, service := range services {
+		if service.Cover == model.ServiceCoverAll {
+			// 除了跳过的服务器，其他都包含
+			for serverID := range serverMap {
+				if !service.SkipServers[serverID] {
+					serverIDSet[serverID] = true
+				}
+			}
+		} else {
+			// 只包含指定的服务器
+			for serverID, enabled := range service.SkipServers {
+				if enabled {
+					serverIDSet[serverID] = true
+				}
+			}
+		}
+	}
+
+	var ret []uint64
+	for id := range serverIDSet {
+		server, ok := serverMap[id]
+		if !ok || server == nil {
+			continue
+		}
+		if userCanViewServer(c, server) {
+			ret = append(ret, id)
+		}
+	}
+
+	return ret, nil
+}
+
+// Create service
+// @Summary Create service
+// @Security BearerAuth
+// @Schemes
+// @Description Create service
+// @Tags auth required
+// @Accept json
+// @param request body model.ServiceForm true "Service Request"
+// @Produce json
+// @Success 200 {object} model.CommonResponse[uint64]
+// @Router /service [post]
+func createService(c *gin.Context) (uint64, error) {
+	var mf model.ServiceForm
+	if err := c.ShouldBindJSON(&mf); err != nil {
+		return 0, err
+	}
+	if err := model.ValidateServiceMonitorType(uint64(mf.Type)); err != nil {
+		return 0, err
+	}
+
+	if !isValidServiceCover(mf.Cover) {
+		return 0, singleton.Localizer.ErrorT("permission denied")
+	}
+
+	uid := getUid(c)
+
+	var m model.Service
+	m.UserID = uid
+	m.Name = mf.Name
+	m.Target = strings.TrimSpace(mf.Target)
+	m.Type = mf.Type
+	m.SkipServers = mf.SkipServers
+	m.Cover = mf.Cover
+	m.DisplayIndex = mf.DisplayIndex
+	m.Notify = mf.Notify
+	m.NotificationGroupID = mf.NotificationGroupID
+	m.Duration = mf.Duration
+	m.LatencyNotify = mf.LatencyNotify
+	m.MinLatency = mf.MinLatency
+	m.MaxLatency = mf.MaxLatency
+	m.HideForGuest = mf.HideForGuest
+	m.EnableTriggerTask = mf.EnableTriggerTask
+	m.RecoverTriggerTasks = mf.RecoverTriggerTasks
+	m.FailTriggerTasks = mf.FailTriggerTasks
+
+	if err := validateServers(c, &m); err != nil {
+		return 0, err
+	}
+
+	if err := singleton.DB.Create(&m).Error; err != nil {
+		return 0, newGormError("%v", err)
+	}
+
+	if err := singleton.ServiceSentinelShared.Update(&m); err != nil {
+		return 0, err
+	}
+
+	singleton.ServiceSentinelShared.UpdateServiceList()
+	return m.ID, nil
+}
+
+// Update service
+// @Summary Update service
+// @Security BearerAuth
+// @Schemes
+// @Description Update service
+// @Tags auth required
+// @Accept json
+// @param id path uint true "Service ID"
+// @param request body model.ServiceForm true "Service Request"
+// @Produce json
+// @Success 200 {object} model.CommonResponse[any]
+// @Router /service/{id} [patch]
+func updateService(c *gin.Context) (any, error) {
+	strID := c.Param("id")
+	id, err := strconv.ParseUint(strID, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	var mf model.ServiceForm
+	if err := c.ShouldBindJSON(&mf); err != nil {
+		return nil, err
+	}
+	if err := model.ValidateServiceMonitorType(uint64(mf.Type)); err != nil {
+		return nil, err
+	}
+
+	if !isValidServiceCover(mf.Cover) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+
+	var m model.Service
+	if err := singleton.DB.First(&m, id).Error; err != nil {
+		return nil, singleton.Localizer.ErrorT("service id %d does not exist", id)
+	}
+
+	if !m.HasPermission(c) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+
+	m.Name = mf.Name
+	m.Target = strings.TrimSpace(mf.Target)
+	m.Type = mf.Type
+	m.SkipServers = mf.SkipServers
+	m.Cover = mf.Cover
+	m.DisplayIndex = mf.DisplayIndex
+	m.Notify = mf.Notify
+	m.NotificationGroupID = mf.NotificationGroupID
+	m.Duration = mf.Duration
+	m.LatencyNotify = mf.LatencyNotify
+	m.MinLatency = mf.MinLatency
+	m.MaxLatency = mf.MaxLatency
+	m.HideForGuest = mf.HideForGuest
+	m.EnableTriggerTask = mf.EnableTriggerTask
+	m.RecoverTriggerTasks = mf.RecoverTriggerTasks
+	m.FailTriggerTasks = mf.FailTriggerTasks
+
+	if err := validateServers(c, &m); err != nil {
+		return 0, err
+	}
+
+	if err := singleton.DB.Save(&m).Error; err != nil {
+		return nil, newGormError("%v", err)
+	}
+
+	// 清理已不在监控范围内的服务器的历史记录
+	skipServers := utils.MapKeysToSlice(mf.SkipServers)
+	if m.Cover == model.ServiceCoverAll {
+		err = singleton.DB.Unscoped().Delete(&model.ServiceHistory{}, "service_id = ? and server_id in (?)", m.ID, skipServers).Error
+	} else {
+		err = singleton.DB.Unscoped().Delete(&model.ServiceHistory{}, "service_id = ? and server_id not in (?) and server_id > 0", m.ID, skipServers).Error
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err := singleton.ServiceSentinelShared.Update(&m); err != nil {
+		return nil, err
+	}
+
+	singleton.ServiceSentinelShared.UpdateServiceList()
+	return nil, nil
+}
+
+// Batch delete service
+// @Summary Batch delete service
+// @Security BearerAuth
+// @Schemes
+// @Description Batch delete service
+// @Tags auth required
+// @Accept json
+// @param request body []uint true "id list"
+// @Produce json
+// @Success 200 {object} model.CommonResponse[any]
+// @Router /batch-delete/service [post]
+func batchDeleteService(c *gin.Context) (any, error) {
+	var ids []uint64
+	if err := c.ShouldBindJSON(&ids); err != nil {
+		return nil, err
+	}
+
+	if !singleton.ServiceSentinelShared.CheckPermission(c, slices.Values(ids)) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+
+	// 与 batchDeleteCron 对称：DispatchTask 没有 PAT 上下文，这里是阻止
+	// 受限 PAT 通过删除 ServiceCoverAll + 不充分 SkipServers 间接影响
+	// 白名单外 owner servers 探测状态的唯一同步入口。
+	for _, id := range ids {
+		existing, ok := singleton.ServiceSentinelShared.Get(id)
+		if !ok || existing == nil {
+			continue
+		}
+		if err := enforcePATServiceDispatchScope(c, existing); err != nil {
+			return nil, err
+		}
+	}
+
+	err := singleton.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Unscoped().Delete(&model.Service{}, "id in (?)", ids).Error; err != nil {
+			return err
+		}
+		return tx.Unscoped().Delete(&model.ServiceHistory{}, "service_id in (?)", ids).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	singleton.ServiceSentinelShared.Delete(ids)
+	singleton.ServiceSentinelShared.UpdateServiceList()
+	return nil, nil
+}
+
+func validateServers(c *gin.Context, ss *model.Service) error {
+	if err := checkServiceSkipServerPermission(c, ss.Cover, ss.SkipServers, ss.GetUserID()); err != nil {
+		return err
+	}
+
+	if err := rejectImplicitServiceCoverForLimitedPAT(c, ss.Cover, ss.SkipServers, ss.GetUserID()); err != nil {
+		return err
+	}
+
+	if !singleton.CronShared.CheckPermission(c, slices.Values(ss.FailTriggerTasks)) {
+		return singleton.Localizer.ErrorT("permission denied")
+	}
+	if !singleton.CronShared.CheckPermission(c, slices.Values(ss.RecoverTriggerTasks)) {
+		return singleton.Localizer.ErrorT("permission denied")
+	}
+	if err := enforcePATTriggerTaskScope(c, ss.FailTriggerTasks, ss.RecoverTriggerTasks); err != nil {
+		return err
+	}
+
+	if err := assertOwnsNotificationGroup(c, ss.NotificationGroupID); err != nil {
+		return err
+	}
+
+	return nil
 }

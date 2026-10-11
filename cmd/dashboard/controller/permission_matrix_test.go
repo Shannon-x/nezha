@@ -261,18 +261,17 @@ func TestShowServiceFiltersCycleTransferStatsLikeServerList(t *testing.T) {
 	assert.NoError(t, singleton.DB.Create(&model.Server{Common: model.Common{ID: 3, UserID: 200}, Name: "hidden member server", UUID: "hidden-member-server", HideForGuest: true}).Error)
 	singleton.ServerShared = singleton.NewServerClass()
 
-	assert.NoError(t, singleton.DB.Create(&model.Service{Common: model.Common{ID: 10, UserID: 1}, Name: "shown service", EnableShowInService: true}).Error)
-	hiddenService := &model.Service{Common: model.Common{ID: 11, UserID: 1}, Name: "hidden service"}
-	assert.NoError(t, singleton.DB.Create(hiddenService).Error)
-	// EnableShowInService 带 gorm:"default: true"，结构体里的零值 false 在 INSERT 时会被
-	// 默认值覆盖成 true；必须显式落库为 false，服务 11 才是真正"隐藏"。
-	assert.NoError(t, singleton.DB.Model(hiddenService).Update("enable_show_in_service", false).Error)
+	assert.NoError(t, singleton.DB.Create(&model.Service{Common: model.Common{ID: 10, UserID: 1}, Name: "shown service", Type: model.TaskTypeTCPPing}).Error)
+	assert.NoError(t, singleton.DB.Create(&model.Service{Common: model.Common{ID: 11, UserID: 1}, Name: "hidden service", Type: model.TaskTypeTCPPing, HideForGuest: true}).Error)
 
 	originalServiceSentinel := singleton.ServiceSentinelShared
 	serviceSentinel, err := singleton.NewServiceSentinel(make(chan *model.Service, 2))
 	assert.NoError(t, err)
 	singleton.ServiceSentinelShared = serviceSentinel
-	t.Cleanup(func() { singleton.ServiceSentinelShared = originalServiceSentinel })
+	t.Cleanup(func() {
+		serviceSentinel.Close()
+		singleton.ServiceSentinelShared = originalServiceSentinel
+	})
 
 	singleton.AlertsLock.Lock()
 	originalCycleTransferStats := singleton.AlertsCycleTransferStatsStore

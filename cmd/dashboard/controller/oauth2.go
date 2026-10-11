@@ -19,17 +19,18 @@ import (
 	"github.com/nezhahq/nezha/service/singleton"
 )
 
-// GHSA-9rc6-8cjv-rcvx：OAuth2 回调 URL 会发给身份提供方，授权码最终落在这个
-// 地址。若直接信任原始 Host 头，攻击者用伪造 Host（或遇到 redirect-URI 宽松匹配
-// 的提供方）即可把受害者授权码导向自己的源、绑定其身份。
-//
-// 策略：请求 Host 命中运维声明的 dashboard host（IsReservedDashboardHost 白名单：
-// InstallHost/DashboardHost/ListenHost/ReservedHosts）时原样信任；否则锁定到运维
-// 声明的 DashboardHost。DashboardHost 为空表示运维未固定对外回调域名，此时透传请求
-// Host —— 这对反代/CF 隧道部署是必要的（浏览器访问用的对外域名只在请求 Host 里，
-// 而 InstallHost 往往是 agent 连接用的 IP:端口，二者不同；强行改写会破坏 OIDC 回调
-// 校验）。需要强校验的部署请在 config.yaml 设置 dashboard_host，并把
-// https://<dashboard_host>/api/v1/oauth2/callback 登记到 OAuth 提供方的回调白名单。
+// GHSA-9rc6-8cjv-rcvx: the OAuth2 callback URL is sent to the identity
+// provider and is where the authorization code lands. Deriving it from the
+// raw Host header lets an attacker who can reach this handler with a forged
+// Host (or a provider with loose redirect-URI matching) divert a victim's
+// code to their own origin and bind the victim's identity. A request Host is
+// trusted only when it is an operator-declared dashboard host (the same
+// allowlist that guards NAT routing). Otherwise the redirect is pinned to the
+// operator-declared DashboardHost. Empty DashboardHost intentionally retains
+// dynamic/multi-domain deployments by passing through request Host; those
+// deployments must validate Host at their trusted proxy and register exact
+// redirect URIs at the OAuth provider. GHSA-rf68-8gjr-36q7 documents this
+// configuration boundary and must be updated if this compatibility changes.
 func getRedirectURL(c *gin.Context) string {
 	scheme := "http://"
 	referer := c.Request.Referer()

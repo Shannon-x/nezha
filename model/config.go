@@ -36,9 +36,9 @@ const (
 
 // DatabaseType constants
 const (
-	DBTypeSQLite   = "sqlite"
-	DBTypeMySQL    = "mysql"
-	DBTypePostgres = "postgres"
+	DBTypeSQLite    = "sqlite"
+	DBTypeMySQL     = "mysql"
+	DBTypePostgres  = "postgres"
 	DBTypeSQLServer = "sqlserver"
 )
 
@@ -46,14 +46,14 @@ const (
 // Environment variables take priority over config file settings
 // Environment variable format: NZ_DATABASE_<FIELD> (e.g., NZ_DATABASE_TYPE, NZ_DATABASE_HOST)
 type DatabaseConfig struct {
-	Type     string `koanf:"type" json:"type"`               // sqlite, mysql, postgres, sqlserver
-	Host     string `koanf:"host" json:"host,omitempty"`     // Database host (for mysql/postgres/sqlserver)
-	Port     uint16 `koanf:"port" json:"port,omitempty"`     // Database port
+	Type     string `koanf:"type" json:"type"`           // sqlite, mysql, postgres, sqlserver
+	Host     string `koanf:"host" json:"host,omitempty"` // Database host (for mysql/postgres/sqlserver)
+	Port     uint16 `koanf:"port" json:"port,omitempty"` // Database port
 	Username string `koanf:"username" json:"username,omitempty"`
 	Password string `koanf:"password" json:"password,omitempty"`
-	DBName   string `koanf:"dbname" json:"dbname,omitempty"` // Database name
+	DBName   string `koanf:"dbname" json:"dbname,omitempty"`   // Database name
 	SSLMode  string `koanf:"sslmode" json:"sslmode,omitempty"` // For PostgreSQL: disable, require, verify-ca, verify-full
-	Path     string `koanf:"path" json:"path,omitempty"`     // For SQLite: file path
+	Path     string `koanf:"path" json:"path,omitempty"`       // For SQLite: file path
 }
 
 // DSN returns the data source name for the configured database type
@@ -102,7 +102,6 @@ func itoa(n uint16) string {
 	return strconv.FormatUint(uint64(n), 10)
 }
 
-
 type ConfigForGuests struct {
 	Language            string `koanf:"language" json:"language"` // 系统语言，默认 zh_CN
 	SiteName            string `koanf:"site_name" json:"site_name"`
@@ -112,11 +111,16 @@ type ConfigForGuests struct {
 
 type ConfigDashboard struct {
 	InstallHost string `koanf:"install_host" json:"install_host,omitempty"`
-	AgentTLS    bool   `koanf:"tls" json:"tls,omitempty"` // 用于前端判断生成的安装命令是否启用 TLS
+	// AgentTLS controls the transport emitted by Agent installation commands.
+	// false intentionally supports trusted private networks and does not provide
+	// Dashboard peer authentication; Internet-facing control planes must use
+	// verified TLS. Changing this compatibility default belongs in the installer
+	// migration path, not in the gRPC task authorization model.
+	AgentTLS bool `koanf:"tls" json:"tls,omitempty"`
 
-	// DashboardHost 是 dashboard 对外访问的主机名，专用于 OAuth2 回调地址，与
-	// InstallHost（agent 连接用主机名）解耦：两者可以是不同域名。为空时 OAuth2
-	// 回调回退到 InstallHost（见 getRedirectURL）。它同样纳入保留 host 白名单。
+	// DashboardHost 是 dashboard 对外访问的主机名，专用于 OAuth2 回调地址。
+	// 它与 InstallHost（agent 连接用主机名）解耦：两者可以是不同域名。
+	// 为空时，OAuth2 回调放行请求 Host（信任请求头），不做强制重写。
 	DashboardHost string `koanf:"dashboard_host" json:"dashboard_host,omitempty"`
 
 	WebRealIPHeader   string `koanf:"web_real_ip_header" json:"web_real_ip_header,omitempty"`     // 前端真实IP
@@ -125,6 +129,9 @@ type ConfigDashboard struct {
 	AdminTemplate     string `koanf:"admin_template" json:"admin_template,omitempty"`
 
 	EnablePlainIPInNotification bool `koanf:"enable_plain_ip_in_notification" json:"enable_plain_ip_in_notification,omitempty"` // 通知信息IP不打码
+	// AllowJWTIPChange disables the IP binding check for browser login sessions.
+	// Keep this disabled by default so a stolen JWT remains bound to its issuing IP.
+	AllowJWTIPChange bool `koanf:"allow_jwt_ip_change" json:"allow_jwt_ip_change,omitempty"`
 
 	EnableMCP bool `koanf:"enable_mcp" json:"enable_mcp,omitempty"` // 是否启用 MCP 入口（默认关闭；启用前请审视 PAT scope/whitelist）
 
@@ -166,6 +173,10 @@ type Config struct {
 	// MCPEnabled()/SetMCPEnabled()。放外层 Config 而非 ConfigDashboard，避免
 	// SettingResponse 按值拷贝 ConfigDashboard 触发 copylocks。
 	mcpEnabled atomic.Bool `koanf:"-" json:"-" yaml:"-"`
+
+	// jwtIPChangeAllowed mirrors AllowJWTIPChange for concurrent authentication
+	// and setting updates. Keep atomic fields outside ConfigDashboard.
+	jwtIPChangeAllowed atomic.Bool `koanf:"-" json:"-" yaml:"-"`
 
 	// oauth2 配置
 	Oauth2 map[string]*Oauth2Config `koanf:"oauth2" json:"oauth2,omitempty"`
@@ -212,6 +223,7 @@ const (
 
 // MemoryConf 内存配置
 type MemoryConf struct {
+	// GoMemLimitMB Go 运行时内存限制(MB)，0 表示不限制
 	GoMemLimitMB int64 `koanf:"go_mem_limit_mb" json:"go_mem_limit_mb,omitempty"`
 }
 
@@ -298,6 +310,8 @@ func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
 		c.JWTTimeout = 1
 	}
 
+	c.jwtIPChangeAllowed.Store(c.AllowJWTIPChange)
+
 	if c.AgentSecretKey == "" {
 		c.AgentSecretKey, err = utils.GenerateRandomString(32)
 		if err != nil {
@@ -323,6 +337,17 @@ func (c *Config) MCPEnabled() bool {
 // 数据竞争。持久化由 save() 在 marshal 前从 atomic 同步明文字段完成。
 func (c *Config) SetMCPEnabled(v bool) {
 	c.mcpEnabled.Store(v)
+}
+
+// JWTIPChangeAllowed reports whether JWT sessions may change IP concurrently.
+func (c *Config) JWTIPChangeAllowed() bool {
+	return c.jwtIPChangeAllowed.Load()
+}
+
+// SetJWTIPChangeAllowed updates only the atomic mirror. save() synchronizes
+// the public field for persistence; authentication must use the accessor.
+func (c *Config) SetJWTIPChangeAllowed(v bool) {
+	c.jwtIPChangeAllowed.Store(v)
 }
 
 // Save 保存配置文件
@@ -393,6 +418,7 @@ func (c *Config) patchYAMLField(key string, value any) error {
 
 func (c *Config) save() error {
 	c.EnableMCP = c.mcpEnabled.Load()
+	c.AllowJWTIPChange = c.jwtIPChangeAllowed.Load()
 	data, err := yaml.Marshal(c)
 	if err != nil {
 		return err

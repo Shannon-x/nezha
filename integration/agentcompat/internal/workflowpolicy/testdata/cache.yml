@@ -1,0 +1,14 @@
+on:
+  pull_request:
+concurrency: policy
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: bin
+          key: executable-cache

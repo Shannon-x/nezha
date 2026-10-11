@@ -13,18 +13,15 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/hashicorp/go-uuid"
-
 	"github.com/nezhahq/nezha/model"
 	"github.com/nezhahq/nezha/pkg/utils"
-	pb "github.com/nezhahq/nezha/proto"
-	"github.com/nezhahq/nezha/service/rpc"
 	"github.com/nezhahq/nezha/service/singleton"
 )
 
@@ -94,6 +91,37 @@ var (
 	transferSecretMu  sync.Mutex
 	transferSecretVal string
 )
+
+var errMCPTransferHostNotConfigured = errors.New("MCP transfer URL host is not an operator-declared dashboard host")
+
+// mcpTransferURLBase never reflects an untrusted request Host into a bearer
+// transfer URL. DashboardHost is the canonical public authority; deployments
+// that intentionally serve multiple names must declare them as reserved hosts.
+func mcpTransferURLBase(c *gin.Context) (string, error) {
+	if c == nil || c.Request == nil || singleton.Conf == nil {
+		return "", errMCPTransferHostNotConfigured
+	}
+
+	requestHost := strings.TrimSpace(c.Request.Host)
+	host := strings.TrimSpace(singleton.Conf.DashboardHost)
+	if host == "" {
+		if !singleton.IsReservedDashboardHost(requestHost) {
+			return "", errMCPTransferHostNotConfigured
+		}
+		host = requestHost
+	}
+
+	parsed, err := url.Parse("//" + host)
+	if err != nil || parsed.Host == "" || parsed.Host != host || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errMCPTransferHostNotConfigured
+	}
+
+	scheme := "https"
+	if c.Request.TLS == nil && c.Request.Header.Get("X-Forwarded-Proto") != "https" {
+		scheme = "http"
+	}
+	return scheme + "://" + host, nil
+}
 
 // transferHMACSecret 返回进程内随机生成的 HMAC key。
 // 这是有意设计：transferEntries 本身也只活在内存 sync.Map 里，dashboard
@@ -319,6 +347,10 @@ func mintTransferTool(c *gin.Context, serverID uint64, path string, ttlSeconds i
 	if err := validateTransferPath(path); err != nil {
 		return nil, err
 	}
+	baseURL, err := mcpTransferURLBase(c)
+	if err != nil {
+		return nil, err
+	}
 	ttl := time.Duration(ttlSeconds) * time.Second
 	if ttl <= 0 {
 		ttl = transferTokenTTLDefault
@@ -352,14 +384,9 @@ func mintTransferTool(c *gin.Context, serverID uint64, path string, ttlSeconds i
 	if err != nil {
 		return nil, err
 	}
-	scheme := "https"
-	if c.Request.TLS == nil && c.Request.Header.Get("X-Forwarded-Proto") != "https" {
-		scheme = "http"
-	}
-	host := c.Request.Host
-	url := fmt.Sprintf("%s://%s/mcp/%s/%s", scheme, host, dir, t)
+	transferURL := fmt.Sprintf("%s/mcp/%s/%s", baseURL, dir, t)
 	return map[string]any{
-		"url":        url,
+		"url":        transferURL,
 		"method":     map[transferDirection]string{transferDirDownload: "GET", transferDirUpload: "POST"}[dir],
 		"expires_at": entry.ExpiresAt,
 	}, nil
@@ -929,96 +956,6 @@ func xferSizeFromU64(raw uint64) (int64, error) {
 		return 0, errors.New("declared size overflows int64")
 	}
 	return int64(raw), nil
-}
-
-// openFsTransferStream 走 IOStream 通道与目标 agent 建立一条专用大文件流。
-// 返回的 io.ReadWriteCloser 既能 Read（接收 agent→dashboard 字节）又能 Write
-// （发送 dashboard→agent 字节）；调用方通过 readXferFixedHeader 解析控制帧。
-//
-// 内部步骤：
-//  1. 分配 streamId，CreateStream(streamId, 0, serverID) 在 NezhaHandler 注册
-//     一个 ioStreamContext，targetServerID 用于 agent 侧 stream 归属校验。
-//  2. 通过 server 当前的 RequestTask 流发 TaskTypeFsTransfer，把 streamId +
-//     req JSON 下发给 agent。
-//  3. 等 agent 通过 IOStream() RPC 完成 magic 引导帧并 AgentConnected。
-//  4. 返回 agent 端流和 cleanup（CloseStream）。
-//
-// 任何步骤失败都会 CloseStream 释放资源；调用方只需在 defer cleanup() 即可。
-func openFsTransferStream(ctx context.Context, serverID uint64, req *model.FsTransferRequest) (io.ReadWriteCloser, func(), error) {
-	if singleton.Conf == nil || !singleton.Conf.MCPEnabled() {
-		return nil, func() {}, errors.New("MCP is disabled by the dashboard administrator")
-	}
-	server, _ := singleton.ServerShared.Get(serverID)
-	if server == nil {
-		return nil, func() {}, errors.New("server offline")
-	}
-	if server.GetTaskStream() == nil {
-		return nil, func() {}, errors.New("server offline")
-	}
-
-	streamId, err := uuid.GenerateUUID()
-	if err != nil {
-		return nil, func() {}, err
-	}
-	req.StreamID = streamId
-
-	if err := rpc.NezhaHandlerSingleton.CreateStreamWithPurpose(streamId, 0, serverID, rpc.PurposeMCPTransfer); err != nil {
-		return nil, func() {}, err
-	}
-	cleanup := func() { _ = rpc.NezhaHandlerSingleton.CloseStream(streamId) }
-
-	body, err := json.Marshal(req)
-	if err != nil {
-		cleanup()
-		return nil, func() {}, err
-	}
-	// 关闭 entry-check 与 SendTask 之间的 TOCTOU：stream 已注册后再复查一次
-	// kill switch / ctx 取消，确保 disable sweep 要么扫到这条已注册 stream、
-	// 要么这里读到 disabled，绝不会在禁用/吊销后仍把 transfer 任务发给 agent。
-	if singleton.Conf == nil || !singleton.Conf.MCPEnabled() {
-		cleanup()
-		return nil, func() {}, errors.New("MCP is disabled by the dashboard administrator")
-	}
-	if err := ctx.Err(); err != nil {
-		cleanup()
-		return nil, func() {}, err
-	}
-	if err := server.SendTask(&pb.Task{
-		Type: model.TaskTypeFsTransfer,
-		Data: string(body),
-	}); err != nil {
-		cleanup()
-		if errors.Is(err, model.ErrTaskStreamOffline) {
-			return nil, func() {}, errors.New("server offline")
-		}
-		return nil, func() {}, err
-	}
-
-	agentStream, ok := rpc.NezhaHandlerSingleton.WaitForAgent(ctx, streamId, 30*time.Second)
-	if !ok {
-		cleanup()
-		return nil, func() {}, errors.New("agent did not attach within 30s")
-	}
-
-	// After attach, the relay blocks in IOStreamWrapper.Read, which only
-	// honours the gRPC stream context — not this per-transfer ctx. Without
-	// the watcher below, a PAT revocation (deleteAPIToken cancels ctx) or a
-	// client disconnect would leave a stalled/compromised agent pinning this
-	// goroutine + IOStream until process restart. Closing the stream on
-	// ctx.Done() unblocks the agent-side handler (iw.Wait) so Read returns.
-	watcherDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = rpc.NezhaHandlerSingleton.CloseStream(streamId)
-		case <-watcherDone:
-		}
-	}()
-	wrappedCleanup := func() {
-		close(watcherDone)
-		cleanup()
-	}
-	return agentStream, wrappedCleanup, nil
 }
 
 // revalidateTransferEntry 在消费一次性 URL 时重新检查 mint 阶段的全部前置。

@@ -1,0 +1,17 @@
+on:
+  pull_request:
+concurrency: policy
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Redact evidence
+        run: go run ./integration/agentcompat/cmd/redact
+      - uses: actions/upload-artifact@v6
+        with:
+          path: |
+            ${{ runner.temp }}/redacted-results
+            ${{ runner.temp }}/raw-results

@@ -30,6 +30,8 @@ func setupJWTSessionTest(t *testing.T) (cleanup func()) {
 	originalConf := singleton.Conf
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.JWTSession{}, &model.WAF{}))
 	singleton.DB = db
 	singleton.Conf = &singleton.ConfigClass{Config: &model.Config{JWTTimeout: 1}}
@@ -42,6 +44,7 @@ func setupJWTSessionTest(t *testing.T) (cleanup func()) {
 	}).Error)
 
 	return func() {
+		_ = sqlDB.Close()
 		singleton.DB = originalDB
 		singleton.Conf = originalConf
 	}
@@ -188,6 +191,61 @@ func TestIdentityHandlerFlagsIPMismatch(t *testing.T) {
 	identity := identityHandler()(verify)
 	assert.Nil(t, identity, "IP mismatch must reject")
 	assert.True(t, verify.GetBool(model.CtxKeyIsIPMismatch))
+}
+
+func TestIdentityHandlerAllowsIPMismatchWhenConfigured(t *testing.T) {
+	cleanup := setupJWTSessionTest(t)
+	defer cleanup()
+	singleton.Conf.SetJWTIPChangeAllowed(true)
+
+	ctx := newCtxForUser(0, "1.2.3.4", "ua")
+	user := model.User{Common: model.Common{ID: 100}, TokenVersion: 7}
+	claims, err := issueJWTSession(ctx, &user, 1)
+	require.NoError(t, err)
+
+	verify := newCtxForUser(0, "9.9.9.9", "ua")
+	verify.Set("JWT_PAYLOAD", jwt.MapClaims{
+		jwtClaimUserID: claims[jwtClaimUserID],
+		jwtClaimKeyID:  claims[jwtClaimKeyID],
+	})
+
+	identity := identityHandler()(verify)
+	require.NotNil(t, identity, "IP mismatch must be accepted when allow_jwt_ip_change is enabled")
+	assert.False(t, verify.GetBool(model.CtxKeyIsIPMismatch))
+}
+
+func TestIdentityHandlerConcurrentIPChangeSetting(t *testing.T) {
+	cleanup := setupJWTSessionTest(t)
+	defer cleanup()
+
+	ctx := newCtxForUser(0, "1.2.3.4", "ua")
+	user := model.User{Common: model.Common{ID: 100}, TokenVersion: 7}
+	claims, err := issueJWTSession(ctx, &user, 1)
+	require.NoError(t, err)
+
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				singleton.Conf.SetJWTIPChangeAllowed(true)
+				singleton.Conf.SetJWTIPChangeAllowed(false)
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+
+	for i := 0; i < 100; i++ {
+		verify := newCtxForUser(0, "1.2.3.4", "ua")
+		verify.Set("JWT_PAYLOAD", jwt.MapClaims(claims))
+		require.NotNil(t, identityHandler()(verify), "matching IP must pass during setting updates")
+	}
 }
 
 func TestIdentityHandlerRejectsUnknownKeyID(t *testing.T) {

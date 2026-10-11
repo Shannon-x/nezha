@@ -14,7 +14,6 @@ import (
 	"github.com/patrickmn/go-cache"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/driver/sqlserver"
 	"gorm.io/gorm"
 	"sigs.k8s.io/yaml"
@@ -113,7 +112,7 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 		if path == "" {
 			path = "data/sqlite.db"
 		}
-		dialector = sqlite.Open(path)
+		dialector = openSQLiteDialector(path)
 		log.Printf("NEZHA>> Using SQLite database at %s", path)
 	default:
 		return fmt.Errorf("unsupported database type: %s", dbConfig.Type)
@@ -142,6 +141,7 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 			sqlDB.SetConnMaxIdleTime(5 * time.Minute)
 		}
 	}
+	migrateServiceVisibility := model.NeedsServiceHideForGuestMigration(DB)
 	err = DB.AutoMigrate(model.Server{}, model.User{}, model.ServerGroup{}, model.NotificationGroup{},
 		model.Notification{}, model.AlertRule{}, model.Service{}, model.NotificationGroupNotification{},
 		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
@@ -154,6 +154,12 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 
 	// 执行数据库迁移（处理容器升级时的类型转换等）
 	model.RunMigrations(DB, dbConfig.Type)
+
+	if migrateServiceVisibility {
+		if err := model.MigrateServiceHideForGuest(DB); err != nil {
+			return fmt.Errorf("failed to migrate service visibility: %w", err)
+		}
+	}
 
 	// 旧 mcp:* scope 与 nezha:* 并行了一段时间，HasScope 通过别名让 mcp:fs:write
 	// 静默扩到 REST nezha:server:write。统一命名后这里把残留旧 scope 一次性
@@ -181,16 +187,15 @@ func RecordTransferHourlyUsage(servers ...*model.Server) {
 	}
 
 	for server := range slist {
+		_, _, deltaIn, deltaOut := server.TransferDeltaAndAdvance()
 		tx := model.Transfer{
 			ServerID: server.ID,
-			In:       utils.SubUintChecked(server.State.NetInTransfer, server.PrevTransferInSnapshot),
-			Out:      utils.SubUintChecked(server.State.NetOutTransfer, server.PrevTransferOutSnapshot),
+			In:       deltaIn,
+			Out:      deltaOut,
 		}
 		if tx.In == 0 && tx.Out == 0 {
 			continue
 		}
-		server.PrevTransferInSnapshot = server.State.NetInTransfer
-		server.PrevTransferOutSnapshot = server.State.NetOutTransfer
 		tx.CreatedAt = nowTrimSeconds
 		txs = append(txs, tx)
 	}
@@ -199,6 +204,13 @@ func RecordTransferHourlyUsage(servers ...*model.Server) {
 		return
 	}
 	log.Printf("NEZHA>> Saved traffic metrics to database. Affected %d row(s), Error: %v", len(txs), DB.Create(txs).Error)
+}
+
+func PersistTransfer(transfer model.Transfer) error {
+	if transfer.In == 0 && transfer.Out == 0 {
+		return nil
+	}
+	return DB.Create(&transfer).Error
 }
 
 // CleanMonitorHistory 清理流量记录（TSDB 有自己的保留策略）
@@ -215,18 +227,21 @@ func CleanMonitorHistory() {
 	}
 
 	// 清理已被删除的服务器的流量记录
-	DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (SELECT `id` FROM servers)")
+	DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (SELECT id FROM servers)")
 
 	// 计算可清理流量记录的时长
 	var allServerKeep time.Time
 	specialServerKeep := make(map[uint64]time.Time)
 	var specialServerIDs []uint64
 	var alerts []model.AlertRule
-	DB.Find(&alerts)
+	if err := DB.Find(&alerts).Error; err != nil {
+		log.Printf("NEZHA>> Failed to load alert rules while cleaning transfer history: %v", err)
+		return
+	}
 	for _, alert := range alerts {
 		for _, rule := range alert.Rules {
 			// 是不是流量记录规则
-			if !rule.IsTransferDurationRule() {
+			if !rule.HasSafeCycleConfiguration() {
 				continue
 			}
 			dataCouldRemoveBefore := rule.GetTransferDurationStart().UTC()
@@ -249,6 +264,14 @@ func CleanMonitorHistory() {
 	}
 	for id, couldRemove := range specialServerKeep {
 		DB.Unscoped().Delete(&model.Transfer{}, "server_id = ? AND created_at < ?", id, couldRemove)
+	}
+	if len(specialServerIDs) == 0 {
+		if allServerKeep.IsZero() {
+			DB.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.Transfer{})
+		} else {
+			DB.Unscoped().Delete(&model.Transfer{}, "created_at < ?", allServerKeep)
+		}
+		return
 	}
 	if allServerKeep.IsZero() {
 		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?)", specialServerIDs)

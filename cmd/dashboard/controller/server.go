@@ -9,10 +9,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/goccy/go-json"
-	"github.com/jinzhu/copier"
 	"gorm.io/gorm"
 
 	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/tsdb"
 	pb "github.com/nezhahq/nezha/proto"
 	"github.com/nezhahq/nezha/service/singleton"
 )
@@ -30,10 +30,13 @@ import (
 // @Router /server [get]
 func listServer(c *gin.Context) ([]*model.Server, error) {
 	slist := singleton.ServerShared.GetSortedList()
-
-	var ssl []*model.Server
-	if err := copier.Copy(&ssl, &slist); err != nil {
-		return nil, err
+	ssl := make([]*model.Server, 0, len(slist))
+	for _, server := range slist {
+		if server == nil {
+			continue
+		}
+		runtime := server.RuntimeSnapshot()
+		ssl = append(ssl, server.RuntimeCopy(runtime))
 	}
 	return ssl, nil
 }
@@ -233,10 +236,9 @@ func getServerConfig(c *gin.Context) (string, error) {
 	}
 
 	s, ok := singleton.ServerShared.Get(id)
-	if !ok {
-		return "", nil
-	}
-	if !s.HasPermission(c) {
+	// Foreign and unknown IDs deliberately share one response so sequential
+	// server IDs cannot be enumerated across tenants.
+	if !ok || !s.HasPermission(c) || !patAllowsServer(c, id) {
 		return "", singleton.Localizer.ErrorT("permission denied")
 	}
 	if s.GetTaskStream() == nil {
@@ -290,16 +292,16 @@ func setServerConfig(c *gin.Context) (*model.ServerTaskResponse, error) {
 	slist := singleton.ServerShared.GetList()
 	servers := make([]*model.Server, 0, len(configForm.Servers))
 	for _, sid := range configForm.Servers {
-		if s, ok := slist[sid]; ok {
-			if !s.HasPermission(c) {
-				return nil, singleton.Localizer.ErrorT("permission denied")
-			}
-			if s.GetTaskStream() == nil {
-				resp.Offline = append(resp.Offline, s.ID)
-				continue
-			}
-			servers = append(servers, s)
+		s, ok := slist[sid]
+		// Match getServerConfig: do not reveal whether a denied ID exists.
+		if !ok || !s.HasPermission(c) || !patAllowsServer(c, sid) {
+			return nil, singleton.Localizer.ErrorT("permission denied")
 		}
+		if s.GetTaskStream() == nil {
+			resp.Offline = append(resp.Offline, s.ID)
+			continue
+		}
+		servers = append(servers, s)
 	}
 
 	var wg sync.WaitGroup
@@ -466,4 +468,90 @@ func batchMoveServer(c *gin.Context) ([]model.BatchMoveServerResult, error) {
 	}
 
 	return results, nil
+}
+
+var serverMetricMap = map[string]tsdb.MetricType{
+	"cpu":              tsdb.MetricServerCPU,
+	"memory":           tsdb.MetricServerMemory,
+	"swap":             tsdb.MetricServerSwap,
+	"disk":             tsdb.MetricServerDisk,
+	"net_in_speed":     tsdb.MetricServerNetInSpeed,
+	"net_out_speed":    tsdb.MetricServerNetOutSpeed,
+	"net_in_transfer":  tsdb.MetricServerNetInTransfer,
+	"net_out_transfer": tsdb.MetricServerNetOutTransfer,
+	"load1":            tsdb.MetricServerLoad1,
+	"load5":            tsdb.MetricServerLoad5,
+	"load15":           tsdb.MetricServerLoad15,
+	"tcp_conn":         tsdb.MetricServerTCPConn,
+	"udp_conn":         tsdb.MetricServerUDPConn,
+	"process_count":    tsdb.MetricServerProcessCount,
+	"temperature":      tsdb.MetricServerTemperature,
+	"uptime":           tsdb.MetricServerUptime,
+	"gpu":              tsdb.MetricServerGPU,
+}
+
+// Get server metrics history
+// @Summary Get server metrics history
+// @Security BearerAuth
+// @Schemes
+// @Description Get server metrics history for a specific server
+// @Tags common
+// @param id path uint true "Server ID"
+// @param metric query string true "Metric name: cpu, memory, swap, disk, net_in_speed, net_out_speed, net_in_transfer, net_out_transfer, load1, load5, load15, tcp_conn, udp_conn, process_count, temperature, uptime, gpu"
+// @param period query string false "Time period: 1d, 7d, 30d (default: 1d)"
+// @Produce json
+// @Success 200 {object} model.CommonResponse[model.ServerMetricsResponse]
+// @Router /server/{id}/metrics [get]
+func getServerMetrics(c *gin.Context) (*model.ServerMetricsResponse, error) {
+	idStr := c.Param("id")
+	serverID, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	server, ok := singleton.ServerShared.Get(serverID)
+	if !ok {
+		return nil, singleton.Localizer.ErrorT("server not found")
+	}
+
+	if !userCanViewServer(c, server) {
+		return nil, singleton.Localizer.ErrorT("unauthorized")
+	}
+	_, isMember := c.Get(model.CtxKeyAuthorizedUser)
+
+	metricName := c.Query("metric")
+	metricType, ok := serverMetricMap[metricName]
+	if !ok {
+		return nil, singleton.Localizer.ErrorT("invalid metric name")
+	}
+
+	periodStr := c.DefaultQuery("period", "1d")
+	period, err := tsdb.ParseQueryPeriod(periodStr)
+	if err != nil {
+		return nil, err
+	}
+
+	if !isMember && period != tsdb.Period1Day {
+		return nil, singleton.Localizer.ErrorT("unauthorized: only 1d data available for guests")
+	}
+
+	response := &model.ServerMetricsResponse{
+		ServerID:   serverID,
+		ServerName: server.Name,
+		Metric:     metricName,
+		DataPoints: make([]model.ServerMetricsDataPoint, 0),
+	}
+
+	if !singleton.TSDBEnabled() {
+		return response, nil
+	}
+
+	points, err := singleton.TSDBShared.QueryServerMetrics(serverID, metricType, period)
+	if err != nil {
+		return nil, err
+	}
+
+	response.DataPoints = points
+
+	return response, nil
 }

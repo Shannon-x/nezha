@@ -66,3 +66,36 @@ func migrateTextColumn(db *gorm.DB, table, column, expectedType string) {
 		}
 	}
 }
+
+// NeedsServiceHideForGuestMigration 判断是否需要把旧的 enable_show_in_service
+// 可见性迁移到 hide_for_guest。上游将 Service.EnableShowInService（true=公开）
+// 改为 HideForGuest（true=对游客隐藏）且未做数据迁移，直接升级会让原本不公开
+// 的服务全部对游客可见。必须在 AutoMigrate 之前调用：之后 hide_for_guest 列
+// 已被创建，无法再区分“首次升级”与“已迁移过”。
+func NeedsServiceHideForGuestMigration(db *gorm.DB) bool {
+	m := db.Migrator()
+	return m.HasTable(&Service{}) &&
+		m.HasColumn(&Service{}, "enable_show_in_service") &&
+		!m.HasColumn(&Service{}, "hide_for_guest")
+}
+
+// MigrateServiceHideForGuest 在 AutoMigrate 创建 hide_for_guest 列之后，把原先
+// 未公开（enable_show_in_service 为 false 或 NULL）的服务标记为对游客隐藏，
+// 其余服务显式置 false，避免新列残留 NULL。旧列保留不删，便于回滚。
+func MigrateServiceHideForGuest(db *gorm.DB) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		hidden := tx.Model(&Service{}).
+			Where("enable_show_in_service = ? OR enable_show_in_service IS NULL", false).
+			UpdateColumn("hide_for_guest", true)
+		if hidden.Error != nil {
+			return hidden.Error
+		}
+		if err := tx.Model(&Service{}).
+			Where("hide_for_guest IS NULL").
+			UpdateColumn("hide_for_guest", false).Error; err != nil {
+			return err
+		}
+		log.Printf("NEZHA>> Migration: marked %d non-public services as hide_for_guest", hidden.RowsAffected)
+		return nil
+	})
+}

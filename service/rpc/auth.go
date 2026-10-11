@@ -177,10 +177,6 @@ func (a *authHandler) check(ctx context.Context) (uint64, error) {
 	return clientID, nil
 }
 
-// firstMetadataValue 返回 keys 中首个存在且非空的 metadata 值（去除首尾空白）。
-// gRPC/HTTP2 会把 header 归一化为小写，但不会统一下划线与连字符，故
-// "client_secret" 与 "client-secret" 是两个不同的 key。某些 agent 构建或中间
-// 代理会发送连字符形式，这里同时接受两种拼写，避免合法 agent 认证失败 (#1197)。
 func firstMetadataValue(md metadata.MD, keys ...string) string {
 	for _, key := range keys {
 		if value, ok := md[key]; ok && len(value) > 0 {
@@ -226,6 +222,9 @@ func authorizeAgentForUUID(userId uint64, clientUUID string) (clientID uint64, h
 	if userId == 0 {
 		// The legacy global agent secret maps to user 0. It predates per-user
 		// agent secrets, so keep it compatible by allowing any existing UUID.
+		// Possession of this deployment-wide master credential is therefore not
+		// a tenant-scoped authorization claim. Removal must follow an inventory and
+		// credential-rotation migration or legacy Agents will be locked out.
 		return cid, true, nil
 	}
 	if server.GetUserID() == userId {

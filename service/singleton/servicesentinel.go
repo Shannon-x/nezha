@@ -2,6 +2,7 @@ package singleton
 
 import (
 	"cmp"
+	"crypto/sha256"
 	"fmt"
 	"iter"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -22,8 +24,10 @@ import (
 )
 
 const (
-	_CurrentStatusSize = 30 // 统计 15 分钟内的数据为当前状态
+	_CurrentStatusSize = 30 // initial capacity for the rolling service window
 )
+
+var serviceEventSequence atomic.Uint64
 
 type serviceResponseItem struct {
 	model.ServiceResponseItem
@@ -46,9 +50,101 @@ type _TodayStatsOfService struct {
 type serviceResponseData = _TodayStatsOfService
 
 type serviceTaskStatus struct {
-	lastStatus uint8
-	t          time.Time
-	result     []*pb.TaskResult
+	lastStatus    uint8
+	stateEpoch    uint64
+	lastHistoryAt time.Time
+	history       serviceResponseData
+	lastData      string
+	result        []serviceWindowBucket
+}
+
+type serviceProbeSample struct {
+	successful bool
+	failed     bool
+	delay      float64
+}
+
+type serviceWindowBucket struct {
+	at        time.Time
+	reporters map[uint64]serviceProbeSample
+}
+
+func (status *serviceTaskStatus) appendResult(now time.Time, reporter uint64, result *pb.TaskResult) {
+	bucketAt := now.Truncate(30 * time.Second)
+	if len(status.result) > 0 && bucketAt.Before(status.result[len(status.result)-1].at) {
+		status.result = nil // wall-clock moved backwards; old buckets are not comparable
+	}
+	if len(status.result) == 0 || !status.result[len(status.result)-1].at.Equal(bucketAt) {
+		status.result = append(status.result, serviceWindowBucket{at: bucketAt, reporters: make(map[uint64]serviceProbeSample)})
+	}
+	bucket := &status.result[len(status.result)-1]
+	sample := bucket.reporters[reporter]
+	if result.Successful {
+		sample.successful = true
+		sample.delay = float64(result.Delay)
+	} else {
+		sample.failed = true
+	}
+	bucket.reporters[reporter] = sample
+	cutoff := now.Add(-15 * time.Minute)
+	first := 0
+	for first < len(status.result) && status.result[first].at.Before(cutoff) {
+		first++
+	}
+	if first > 0 {
+		status.result = append([]serviceWindowBucket(nil), status.result[first:]...)
+	}
+	if result.Successful {
+		status.history.Up++
+		status.history.Delay = (status.history.Delay*float64(status.history.Up-1) + float64(result.Delay)) / float64(status.history.Up)
+	} else {
+		status.history.Down++
+	}
+	status.lastData = result.Data
+}
+
+// flushServiceHistory persists the previous non-overlapping reporting period
+// before the next observation is added, so long probe gaps cannot lose or
+// double-count samples in the 15-minute availability history.
+func (ss *ServiceSentinel) flushServiceHistory(serviceID uint64, status *serviceTaskStatus, now time.Time) {
+	if status.lastHistoryAt.IsZero() || now.Before(status.lastHistoryAt.Add(15*time.Minute)) {
+		return
+	}
+	if status.history.Up+status.history.Down == 0 {
+		status.lastHistoryAt = now
+		return
+	}
+	if !TSDBEnabled() {
+		if err := DB.Create(&model.ServiceHistory{
+			CreatedAt: status.lastHistoryAt,
+			ServiceID: serviceID,
+			AvgDelay:  status.history.Delay,
+			Data:      status.lastData,
+			Up:        status.history.Up,
+			Down:      status.history.Down,
+		}).Error; err != nil {
+			log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
+			return
+		}
+	}
+	status.history = serviceResponseData{}
+	status.lastHistoryAt = now
+}
+
+func (status *serviceTaskStatus) responseData() serviceResponseData {
+	var data serviceResponseData
+	for _, bucket := range status.result {
+		for _, sample := range bucket.reporters {
+			if sample.successful {
+				data.Up++
+				data.Delay = (data.Delay*float64(data.Up-1) + sample.delay) / float64(data.Up)
+			}
+			if sample.failed {
+				data.Down++
+			}
+		}
+	}
+	return data
 }
 
 type pingStore struct {
@@ -74,8 +170,11 @@ type ServiceSentinel struct {
 	serviceCurrentStatusData     map[uint64]*serviceTaskStatus    // 当前任务结果缓存
 	serviceResponseDataStore     map[uint64]serviceResponseData   // 当前数据
 
-	serviceResponsePing map[uint64]map[uint64]*pingStore // [service_id] -> ClientID -> delay
-	tlsCertCache        map[uint64]string
+	serviceResponsePing                   map[uint64]map[uint64]*pingStore // guarded by serviceResponseDataStoreLock; [service_id] -> ClientID -> delay
+	tlsCertCache                          map[uint64]string                // guarded by serviceResponseDataStoreLock
+	serviceReportValidatedHook            func(uint64)
+	loadStatsResponseLockedHook           func()
+	serviceReportBeforeTLSSideEffectsHook func(uint64)
 
 	servicesLock    sync.RWMutex
 	serviceListLock sync.RWMutex
@@ -135,7 +234,7 @@ func NewServiceSentinel(serviceSentinelDispatchBus chan<- *model.Service) (*Serv
 		return nil, err
 	}
 
-	// 每天凌晨 4:20 执行系统存储维护 (原来是每周日，改为每日以防积累过多数据)
+	// 每天凌晨 4:20 执行系统存储维护（上游为每周日，改为每日以防积累过多数据）
 	_, err = CronShared.AddFunc("0 20 4 * * *", PerformMaintenance)
 	if err != nil {
 		log.Printf("NEZHA>> Warning: failed to schedule maintenance task: %v", err)
@@ -206,7 +305,15 @@ func (ss *ServiceSentinel) loadServiceHistory() error {
 		return err
 	}
 
+	validServices := services[:0]
 	for _, service := range services {
+		if err := model.ValidateServiceMonitorType(uint64(service.Type)); err != nil {
+			// Existing databases may contain values written before Service.Type was
+			// constrained. Quarantine them in the database for operator review, but
+			// never register a cron job that could dispatch a privileged Agent task.
+			log.Printf("NEZHA>> quarantining service %d: %v", service.ID, err)
+			continue
+		}
 		task := service
 		// 通过cron定时将服务监控任务传递给任务调度管道
 		service.CronJobID, err = CronShared.AddFunc(task.CronSpec(), func() {
@@ -217,9 +324,11 @@ func (ss *ServiceSentinel) loadServiceHistory() error {
 		}
 		ss.services[service.ID] = service
 		ss.serviceCurrentStatusData[service.ID] = new(serviceTaskStatus)
-		ss.serviceCurrentStatusData[service.ID].result = make([]*pb.TaskResult, 0, _CurrentStatusSize)
+		ss.serviceCurrentStatusData[service.ID].result = make([]serviceWindowBucket, 0, _CurrentStatusSize)
 		ss.serviceStatusToday[service.ID] = &_TodayStatsOfService{}
+		validServices = append(validServices, service)
 	}
+	services = validServices
 	ss.serviceList = services
 	sortServices(ss.serviceList)
 
@@ -250,6 +359,7 @@ func (ss *ServiceSentinel) loadMonthlyStatusFromTSDB(services []*model.Service, 
 	if len(services) == 0 {
 		return
 	}
+	// 批量一次查询所有服务的日统计：逐服务查询在千万级数据量下会让启动卡死。
 	serviceIDs := make([]uint64, 0, len(services))
 	for _, service := range services {
 		serviceIDs = append(serviceIDs, service.ID)
@@ -347,6 +457,13 @@ func (ss *ServiceSentinel) loadTodayStats(today time.Time) {
 }
 
 func (ss *ServiceSentinel) Update(m *model.Service) error {
+	if m == nil {
+		return fmt.Errorf("service is nil")
+	}
+	if err := model.ValidateServiceMonitorType(uint64(m.Type)); err != nil {
+		return err
+	}
+
 	ss.serviceResponseDataStoreLock.Lock()
 	defer ss.serviceResponseDataStoreLock.Unlock()
 	ss.monthlyStatusLock.Lock()
@@ -362,6 +479,9 @@ func (ss *ServiceSentinel) Update(m *model.Service) error {
 	if err != nil {
 		return err
 	}
+	// A service edit may disable notifications or change their recipients.
+	// Cancel any retry worker holding the previous service configuration.
+	NotificationShared.CancelServiceState(m.ID)
 	if ss.services[m.ID] != nil {
 		// 停掉旧任务
 		CronShared.Remove(ss.services[m.ID].CronJobID)
@@ -378,7 +498,7 @@ func (ss *ServiceSentinel) Update(m *model.Service) error {
 		if ss.serviceCurrentStatusData[m.ID] == nil {
 			ss.serviceCurrentStatusData[m.ID] = new(serviceTaskStatus)
 		}
-		ss.serviceCurrentStatusData[m.ID].result = make([]*pb.TaskResult, 0, _CurrentStatusSize)
+		ss.serviceCurrentStatusData[m.ID].result = make([]serviceWindowBucket, 0, _CurrentStatusSize)
 		ss.serviceStatusToday[m.ID] = &_TodayStatsOfService{}
 	}
 	// 更新这个任务
@@ -395,13 +515,24 @@ func (ss *ServiceSentinel) Delete(ids []uint64) {
 	defer ss.servicesLock.Unlock()
 
 	for _, id := range ids {
+		NotificationShared.CancelServiceState(id)
 		delete(ss.serviceCurrentStatusData, id)
 		delete(ss.serviceResponseDataStore, id)
+		delete(ss.serviceResponsePing, id)
 		delete(ss.tlsCertCache, id)
 		delete(ss.serviceStatusToday, id)
 
 		// 停掉定时任务
-		CronShared.Remove(ss.services[id].CronJobID)
+		// GHSA-jx78-55p5-rwv5 (Finding 2): guard against a caller supplying an id
+		// that does not exist in the in-memory registry.  CheckPermission returns
+		// vacuously true for unknown ids, so the controller layer cannot prevent
+		// this.  Without the guard, ss.services[id] is nil and the .CronJobID
+		// field access panics, aborting the Delete loop before the remaining valid
+		// ids are cleaned from memory — their service records were already deleted
+		// from the database, producing zombie services.
+		if svc := ss.services[id]; svc != nil {
+			CronShared.Remove(svc.CronJobID)
+		}
 		delete(ss.services, id)
 
 		delete(ss.monthlyStatus, id)
@@ -409,12 +540,15 @@ func (ss *ServiceSentinel) Delete(ids []uint64) {
 }
 
 func (ss *ServiceSentinel) LoadStats() map[uint64]*serviceResponseItem {
-	ss.servicesLock.RLock()
-	defer ss.servicesLock.RUnlock()
 	ss.serviceResponseDataStoreLock.RLock()
 	defer ss.serviceResponseDataStoreLock.RUnlock()
+	if ss.loadStatsResponseLockedHook != nil {
+		ss.loadStatsResponseLockedHook()
+	}
 	ss.monthlyStatusLock.Lock()
 	defer ss.monthlyStatusLock.Unlock()
+	ss.servicesLock.RLock()
+	defer ss.servicesLock.RUnlock()
 
 	// 刷新最新一天的数据
 	for k := range ss.services {
@@ -447,9 +581,6 @@ func (ss *ServiceSentinel) CopyStats() map[uint64]model.ServiceResponseItem {
 	var stats map[uint64]*serviceResponseItem
 	copier.Copy(&stats, ss.LoadStats())
 
-	// 不再在此按 EnableShowInService 一刀切过滤：按查看者权限的收窄已移到
-	// controller.filterServiceStatsForViewer（属主/管理员可见隐藏服务，游客只见公开），
-	// 与服务器列表的可见性一致。CopyStats 返回全部统计副本。
 	sri := make(map[uint64]model.ServiceResponseItem)
 	for k, service := range stats {
 		service.ServiceName = service.service.Name
@@ -543,156 +674,162 @@ func (ss *ServiceSentinel) Close() {
 func (ss *ServiceSentinel) worker() {
 	// 从服务状态汇报管道获取汇报的服务数据
 	for r := range ss.serviceReportChannel {
-		cs, _ := ss.Get(r.Data.GetId())
-		reporter, _ := ServerShared.Get(r.Reporter)
-		// 入站结果必须匹配出站任务派发边界，避免 agent 伪造其他服务 ID 写入监控状态。
-		if !canReportServiceResult(cs, reporter, r.Data.GetType()) {
-			log.Printf("NEZHA>> Incorrect service monitor report %+v", r)
-			continue
-		}
-
-		mh := r.Data
-		if mh.Type == model.TaskTypeTCPPing || mh.Type == model.TaskTypeICMPPing {
-			// TCP/ICMP Ping 使用平均值计算后再写入
-			serviceTcpMap, ok := ss.serviceResponsePing[mh.GetId()]
-			if !ok {
-				serviceTcpMap = make(map[uint64]*pingStore)
-				ss.serviceResponsePing[mh.GetId()] = serviceTcpMap
-			}
-			ts, ok := serviceTcpMap[r.Reporter]
-			if !ok {
-				ts = &pingStore{}
-			}
-			ts.count++
-			ts.ping = (ts.ping*float64(ts.count-1) + float64(mh.Delay)) / float64(ts.count)
-			if mh.Successful {
-				ts.successCount++
-			}
-			if ts.count == Conf.AvgPingCount {
-				if TSDBEnabled() {
-					if err := TSDBShared.WriteServiceMetrics(&tsdb.ServiceMetrics{
-						ServiceID:  mh.GetId(),
-						ServerID:   r.Reporter,
-						Timestamp:  time.Now(),
-						Delay:      ts.ping,
-						Successful: ts.successCount*2 >= ts.count,
-					}); err != nil {
-						log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
-					}
-				} else {
-					if err := DB.Create(&model.ServiceHistory{
-						ServiceID: mh.GetId(),
-						AvgDelay:  ts.ping,
-						Data:      mh.Data,
-						ServerID:  r.Reporter,
-					}).Error; err != nil {
-						log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
-					}
+		serverShared := ServerShared
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("NEZHA>> Service monitor report processing panicked: %v", recovered)
 				}
-				ts.count = 0
-				ts.ping = 0
-				ts.successCount = 0
-			}
-			serviceTcpMap[r.Reporter] = ts
-		} else {
+			}()
+			ss.processReport(r, serverShared)
+		}()
+	}
+}
+
+func (ss *ServiceSentinel) processReport(r ReportData, serverShared *ServerClass) {
+	serverShared.lockLifecycleRead()
+	defer serverShared.unlockLifecycleRead()
+
+	cs, _ := ss.Get(r.Data.GetId())
+	reporter, _ := serverShared.Get(r.Reporter)
+	// 入站结果必须匹配出站任务派发边界，避免 agent 伪造其他服务 ID 写入监控状态。
+	if !canReportServiceResult(cs, reporter, r.Data.GetType()) {
+		log.Printf("NEZHA>> Incorrect service monitor report %+v", r)
+		return
+	}
+	if ss.serviceReportValidatedHook != nil {
+		ss.serviceReportValidatedHook(r.Data.GetId())
+	}
+
+	mh := r.Data
+	m := serverShared.GetList()
+	// Serialize Delete and Update before this accepted report causes any side effect.
+	ss.serviceResponseDataStoreLock.Lock()
+	defer ss.serviceResponseDataStoreLock.Unlock()
+	serviceStatusToday := ss.serviceStatusToday[mh.GetId()]
+	serviceCurrentStatusData := ss.serviceCurrentStatusData[mh.GetId()]
+	currentService, serviceExists := ss.Get(mh.GetId())
+	if serviceStatusToday == nil || serviceCurrentStatusData == nil || !serviceExists ||
+		!canReportServiceResult(currentService, reporter, mh.GetType()) {
+		return
+	}
+	cs = currentService
+
+	if mh.Type == model.TaskTypeTCPPing || mh.Type == model.TaskTypeICMPPing {
+		// TCP/ICMP Ping 使用平均值计算后再写入
+		serviceTcpMap, ok := ss.serviceResponsePing[mh.GetId()]
+		if !ok {
+			serviceTcpMap = make(map[uint64]*pingStore)
+			ss.serviceResponsePing[mh.GetId()] = serviceTcpMap
+		}
+		ts, ok := serviceTcpMap[r.Reporter]
+		if !ok {
+			ts = &pingStore{}
+		}
+		ts.count++
+		ts.ping = (ts.ping*float64(ts.count-1) + float64(mh.Delay)) / float64(ts.count)
+		if mh.Successful {
+			ts.successCount++
+		}
+		if ts.count == Conf.AvgPingCount {
 			if TSDBEnabled() {
 				if err := TSDBShared.WriteServiceMetrics(&tsdb.ServiceMetrics{
 					ServiceID:  mh.GetId(),
 					ServerID:   r.Reporter,
 					Timestamp:  time.Now(),
-					Delay:      float64(mh.Delay),
-					Successful: mh.Successful,
+					Delay:      ts.ping,
+					Successful: ts.successCount*2 >= ts.count,
 				}); err != nil {
 					log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
 				}
-			}
-		}
-
-		ss.serviceResponseDataStoreLock.Lock()
-		// 写入当天状态
-		if mh.Successful {
-			ss.serviceStatusToday[mh.GetId()].Delay = (ss.serviceStatusToday[mh.
-				GetId()].Delay*float64(ss.serviceStatusToday[mh.GetId()].Up) +
-				float64(mh.Delay)) / float64(ss.serviceStatusToday[mh.GetId()].Up+1)
-			ss.serviceStatusToday[mh.GetId()].Up++
-		} else {
-			ss.serviceStatusToday[mh.GetId()].Down++
-		}
-
-		currentTime := time.Now()
-		if ss.serviceCurrentStatusData[mh.GetId()].t.IsZero() {
-			ss.serviceCurrentStatusData[mh.GetId()].t = currentTime
-		}
-
-		// 写入当前数据
-		if ss.serviceCurrentStatusData[mh.GetId()].t.Before(currentTime) {
-			ss.serviceCurrentStatusData[mh.GetId()].t = currentTime.Add(30 * time.Second)
-			ss.serviceCurrentStatusData[mh.GetId()].result = append(ss.serviceCurrentStatusData[mh.GetId()].result, mh)
-		}
-
-		// 更新当前状态
-		ss.serviceResponseDataStore[mh.GetId()] = serviceResponseData{}
-
-		// 永远是最新的 30 个数据的状态 [01:00, 02:00, 03:00] -> [04:00, 02:00, 03: 00]
-		for _, cs := range ss.serviceCurrentStatusData[mh.GetId()].result {
-			if cs.GetId() > 0 {
-				rd := ss.serviceResponseDataStore[mh.GetId()]
-				if cs.Successful {
-					rd.Up++
-					rd.Delay = (rd.Delay*float64(rd.Up-1) + float64(cs.Delay)) / float64(rd.Up)
-				} else {
-					rd.Down++
-				}
-				ss.serviceResponseDataStore[mh.GetId()] = rd
-			}
-		}
-
-		// 计算在线率，
-		var stateCode uint8
-		{
-			upPercent := uint64(0)
-			rd := ss.serviceResponseDataStore[mh.GetId()]
-			if rd.Down+rd.Up > 0 {
-				upPercent = rd.Up * 100 / (rd.Down + rd.Up)
-			}
-			stateCode = GetStatusCode(upPercent)
-		}
-
-		if len(ss.serviceCurrentStatusData[mh.GetId()].result) == _CurrentStatusSize {
-			ss.serviceCurrentStatusData[mh.GetId()].t = currentTime
-			if !TSDBEnabled() {
-				rd := ss.serviceResponseDataStore[mh.GetId()]
+			} else {
 				if err := DB.Create(&model.ServiceHistory{
 					ServiceID: mh.GetId(),
-					AvgDelay:  rd.Delay,
+					AvgDelay:  ts.ping,
 					Data:      mh.Data,
-					Up:        rd.Up,
-					Down:      rd.Down,
+					ServerID:  r.Reporter,
 				}).Error; err != nil {
 					log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
 				}
 			}
-			ss.serviceCurrentStatusData[mh.GetId()].result = ss.serviceCurrentStatusData[mh.GetId()].result[:0]
+			ts.count = 0
+			ts.ping = 0
+			ts.successCount = 0
+		}
+		serviceTcpMap[r.Reporter] = ts
+	} else {
+		if TSDBEnabled() {
+			if err := TSDBShared.WriteServiceMetrics(&tsdb.ServiceMetrics{
+				ServiceID:  mh.GetId(),
+				ServerID:   r.Reporter,
+				Timestamp:  time.Now(),
+				Delay:      float64(mh.Delay),
+				Successful: mh.Successful,
+			}); err != nil {
+				log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
+			}
+		}
+	}
+
+	// 写入当天状态
+	if mh.Successful {
+		serviceStatusToday.Delay = (serviceStatusToday.Delay*float64(serviceStatusToday.Up) +
+			float64(mh.Delay)) / float64(serviceStatusToday.Up+1)
+		serviceStatusToday.Up++
+	} else {
+		serviceStatusToday.Down++
+	}
+
+	currentTime := time.Now()
+	ss.flushServiceHistory(mh.GetId(), serviceCurrentStatusData, currentTime)
+	// Include every accepted reporter's result. A fixed count of samples is
+	// not a 15-minute window when probes have different intervals or reporters.
+	serviceCurrentStatusData.appendResult(currentTime, r.Reporter, mh)
+	if serviceCurrentStatusData.lastHistoryAt.IsZero() {
+		serviceCurrentStatusData.lastHistoryAt = currentTime
+	}
+
+	// 更新当前状态
+	ss.serviceResponseDataStore[mh.GetId()] = serviceCurrentStatusData.responseData()
+
+	// 计算在线率，
+	var stateCode uint8
+	{
+		upPercent := uint64(0)
+		rd := ss.serviceResponseDataStore[mh.GetId()]
+		if rd.Down+rd.Up > 0 {
+			upPercent = rd.Up * 100 / (rd.Down + rd.Up)
+		}
+		if rd.Down+rd.Up == 0 {
+			stateCode = StatusNoData
+		} else {
+			stateCode = GetStatusCode(upPercent)
+		}
+	}
+
+	// 延迟报警
+	if mh.Delay > 0 {
+		delayCheck(&r, m, cs, mh)
+	}
+
+	// 状态变更报警+触发任务执行
+	if stateCode == StatusDown || stateCode != serviceCurrentStatusData.lastStatus {
+		lastStatus := serviceCurrentStatusData.lastStatus
+		// 存储新的状态值
+		serviceCurrentStatusData.lastStatus = stateCode
+		if stateCode != lastStatus {
+			serviceCurrentStatusData.stateEpoch = serviceEventSequence.Add(1)
 		}
 
-		cs, _ = ss.Get(mh.GetId())
-		m := ServerShared.GetList()
-		// 延迟报警
-		if mh.Delay > 0 {
-			delayCheck(&r, m, cs, mh)
+		notifyCheck(&r, m, cs, mh, lastStatus, stateCode, serviceCurrentStatusData.stateEpoch)
+	}
+
+	// TLS 证书报警仅适用于 HTTPS 探针。其它探针的任意响应文本
+	// 不得被当作证书资料解析。
+	if mh.Type == model.TaskTypeHTTPGet && strings.HasPrefix(strings.ToLower(cs.Target), "https://") {
+		if ss.serviceReportBeforeTLSSideEffectsHook != nil {
+			ss.serviceReportBeforeTLSSideEffectsHook(mh.GetId())
 		}
-
-		// 状态变更报警+触发任务执行
-		if stateCode == StatusDown || stateCode != ss.serviceCurrentStatusData[mh.GetId()].lastStatus {
-			lastStatus := ss.serviceCurrentStatusData[mh.GetId()].lastStatus
-			// 存储新的状态值
-			ss.serviceCurrentStatusData[mh.GetId()].lastStatus = stateCode
-
-			notifyCheck(&r, m, cs, mh, lastStatus, stateCode)
-		}
-		ss.serviceResponseDataStoreLock.Unlock()
-
-		// TLS 证书报警
 		var errMsg string
 		if strings.HasPrefix(mh.Data, "SSL证书错误：") {
 			// i/o timeout、connection timeout、EOF 错误
@@ -702,7 +839,7 @@ func (ss *ServiceSentinel) worker() {
 				errMsg = mh.Data
 				if cs.Notify {
 					muteLabel := NotificationMuteLabel.ServiceTLS(mh.GetId(), "network")
-					go NotificationShared.SendNotification(cs.NotificationGroupID, Localizer.Tf("[TLS] Fetch cert info failed, Reporter: %s, Error: %s", cs.Name, errMsg), muteLabel)
+					NotificationShared.SendNotificationAsync(cs.NotificationGroupID, Localizer.Tf("[TLS] Fetch cert info failed, Reporter: %s, Error: %s", cs.Name, errMsg), muteLabel)
 				}
 			}
 		} else {
@@ -712,6 +849,11 @@ func (ss *ServiceSentinel) worker() {
 			var newCert = strings.Split(mh.Data, "|")
 			if len(newCert) > 1 {
 				enableNotify := cs.Notify
+				expiresNew, newErr := time.Parse("2006-01-02 15:04:05 -0700 MST", newCert[1])
+				if newErr != nil {
+					log.Printf("NEZHA>> Ignoring malformed TLS certificate expiry for service %d", mh.GetId())
+					return
+				}
 
 				// 首次获取证书信息时，缓存证书信息
 				if ss.tlsCertCache[mh.GetId()] == "" {
@@ -720,13 +862,18 @@ func (ss *ServiceSentinel) worker() {
 
 				oldCert := strings.Split(ss.tlsCertCache[mh.GetId()], "|")
 				isCertChanged := false
-				expiresOld, _ := time.Parse("2006-01-02 15:04:05 -0700 MST", oldCert[1])
-				expiresNew, _ := time.Parse("2006-01-02 15:04:05 -0700 MST", newCert[1])
+				expiresOld, oldErr := time.Parse("2006-01-02 15:04:05 -0700 MST", oldCert[1])
+				if oldErr != nil {
+					log.Printf("NEZHA>> Ignoring malformed TLS certificate expiry for service %d", mh.GetId())
+					return
+				}
 
-				// 证书变更时，更新缓存
-				if oldCert[0] != newCert[0] && !expiresNew.Equal(expiresOld) {
+				// 只有通知成功后才推进基线；失败时下一次探针结果会重试。
+				if oldCert[0] != newCert[0] || !expiresNew.Equal(expiresOld) {
 					isCertChanged = true
-					ss.tlsCertCache[mh.GetId()] = mh.Data
+					if !enableNotify {
+						ss.tlsCertCache[mh.GetId()] = mh.Data
+					}
 				}
 
 				notificationGroupID := cs.NotificationGroupID
@@ -745,7 +892,7 @@ func (ss *ServiceSentinel) worker() {
 						// 静音规则： 服务id+证书过期时间
 						// 用于避免多个监测点对相同证书同时报警
 						muteLabel := NotificationMuteLabel.ServiceTLS(mh.GetId(), fmt.Sprintf("expire_%s", expiresTimeStr))
-						go NotificationShared.SendNotification(notificationGroupID, fmt.Sprintf("[TLS] %s %s", serviceName, errMsg), muteLabel)
+						NotificationShared.SendNotificationAsync(notificationGroupID, fmt.Sprintf("[TLS] %s %s", serviceName, errMsg), muteLabel)
 					}
 
 					// 证书变更提醒
@@ -754,8 +901,15 @@ func (ss *ServiceSentinel) worker() {
 							"TLS certificate changed, old: issuer %s, expires at %s; new: issuer %s, expires at %s",
 							oldCert[0], expiresOld.Format("2006-01-02 15:04:05"), newCert[0], expiresNew.Format("2006-01-02 15:04:05"))
 
-						// 证书变更后会自动更新缓存，所以不需要静音
-						go NotificationShared.SendNotification(notificationGroupID, fmt.Sprintf("[TLS] %s %s", serviceName, errMsg), "")
+						oldRaw, newRaw, serviceID := ss.tlsCertCache[mh.GetId()], mh.Data, mh.GetId()
+						muteLabel := NotificationMuteLabel.ServiceTLS(serviceID, fmt.Sprintf("change_%x", sha256.Sum256([]byte(newRaw))))
+						NotificationShared.sendNotificationAsync(notificationGroupID, fmt.Sprintf("[TLS] %s %s", serviceName, errMsg), muteLabel, func() {
+							ss.serviceResponseDataStoreLock.Lock()
+							if ss.serviceCurrentStatusData[serviceID] != nil && ss.tlsCertCache[serviceID] == oldRaw {
+								ss.tlsCertCache[serviceID] = newRaw
+							}
+							ss.serviceResponseDataStoreLock.Unlock()
+						})
 					}
 				}
 			}
@@ -768,19 +922,27 @@ func delayCheck(r *ReportData, m map[uint64]*model.Server, ss *model.Service, mh
 		return
 	}
 
+	// GHSA-jx78-55p5-rwv5 (incomplete fix of GHSA-qjpp-gffx-2wm9): the server
+	// map snapshot m is taken outside serviceResponseDataStoreLock and
+	// ServerShared has its own independent lock, so a concurrent batch-delete of
+	// the reporter's server can remove the entry between the pre-lock validation
+	// and this point.  Guard against the nil pointer before using the server.
+	reporterServer := m[r.Reporter]
+	if reporterServer == nil {
+		return
+	}
+
 	notificationGroupID := ss.NotificationGroupID
 	minMuteLabel := NotificationMuteLabel.ServiceLatencyMin(mh.GetId())
 	maxMuteLabel := NotificationMuteLabel.ServiceLatencyMax(mh.GetId())
 	if mh.Delay > ss.MaxLatency {
 		// 延迟超过最大值
-		reporterServer := m[r.Reporter]
 		msg := Localizer.Tf("[Latency] %s %2f > %2f, Reporter: %s", ss.Name, mh.Delay, ss.MaxLatency, reporterServer.Name)
-		go NotificationShared.SendNotification(notificationGroupID, msg, minMuteLabel)
+		NotificationShared.SendNotificationAsync(notificationGroupID, msg, minMuteLabel)
 	} else if mh.Delay < ss.MinLatency {
 		// 延迟低于最小值
-		reporterServer := m[r.Reporter]
 		msg := Localizer.Tf("[Latency] %s %2f < %2f, Reporter: %s", ss.Name, mh.Delay, ss.MinLatency, reporterServer.Name)
-		go NotificationShared.SendNotification(notificationGroupID, msg, maxMuteLabel)
+		NotificationShared.SendNotificationAsync(notificationGroupID, msg, maxMuteLabel)
 	} else {
 		// 正常延迟， 清除静音缓存
 		NotificationShared.UnMuteNotification(notificationGroupID, minMuteLabel)
@@ -789,27 +951,27 @@ func delayCheck(r *ReportData, m map[uint64]*model.Server, ss *model.Service, mh
 }
 
 func notifyCheck(r *ReportData, m map[uint64]*model.Server,
-	ss *model.Service, mh *pb.TaskResult, lastStatus, stateCode uint8) {
+	ss *model.Service, mh *pb.TaskResult, lastStatus, stateCode uint8, stateEpoch uint64) {
+	// GHSA-jx78-55p5-rwv5: guard against concurrent server deletion (same TOCTOU
+	// class as the 2026-07-21 fix, a few dozen lines lower in the same worker).
+	// ServerShared has its own lock; m is a snapshot taken outside
+	// serviceResponseDataStoreLock, so the server may have been removed between
+	// the pre-lock validation and here.
+	reporterServer := m[r.Reporter]
+
 	// 判断是否需要发送通知
 	isNeedSendNotification := ss.Notify && (lastStatus != 0 || stateCode == StatusDown)
-	if isNeedSendNotification {
-		reporterServer := m[r.Reporter]
+	if isNeedSendNotification && reporterServer != nil {
 		notificationGroupID := ss.NotificationGroupID
 		notificationMsg := Localizer.Tf("[%s] %s Reporter: %s, Error: %s", StatusCodeToString(stateCode), ss.Name, reporterServer.Name, mh.Data)
-		muteLabel := NotificationMuteLabel.ServiceStateChanged(mh.GetId())
+		muteLabel := fmt.Sprintf("%s:%d:%d", NotificationMuteLabel.ServiceStateChanged(mh.GetId()), stateCode, stateEpoch)
 
-		// 状态变更时，清除静音缓存
-		if stateCode != lastStatus {
-			NotificationShared.UnMuteNotification(notificationGroupID, muteLabel)
-		}
-
-		go NotificationShared.SendNotification(notificationGroupID, notificationMsg, muteLabel)
+		NotificationShared.SendServiceState(mh.GetId(), notificationGroupID, notificationMsg, muteLabel)
 	}
 
 	// 判断是否需要触发任务
 	isNeedTriggerTask := ss.EnableTriggerTask && lastStatus != 0
-	if isNeedTriggerTask {
-		reporterServer := m[r.Reporter]
+	if isNeedTriggerTask && reporterServer != nil {
 		if stateCode == StatusGood && lastStatus != stateCode {
 			// 当前状态正常 前序状态非正常时 触发恢复任务
 			go CronShared.SendTriggerTasks(ss.RecoverTriggerTasks, reporterServer.ID, ss.UserID)
@@ -829,9 +991,6 @@ const (
 )
 
 func GetStatusCode[T constraints.Float | constraints.Integer](percent T) uint8 {
-	if percent == 0 {
-		return StatusNoData
-	}
 	if percent > 95 {
 		return StatusGood
 	}

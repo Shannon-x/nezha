@@ -179,58 +179,66 @@ func (ns *NotificationServerBundle) replaceParamsInString(str string, message st
 	}
 
 	if ns.Server != nil {
+		runtime := ns.Server.RuntimeSnapshot()
 		replacements = append(replacements,
 			"#SERVER.NAME#", mod(ns.Server.Name),
 			"#SERVER.ID#", mod(fmt.Sprintf("%d", ns.Server.ID)),
-
-			// Converted metrics
-			"#SERVER.CPU#", mod(ns.formatUsage(false, ns.Server.State.CPU)),
-			"#SERVER.MEM#", mod(ns.formatUsage(true, safeDiv(float64(ns.Server.State.MemUsed), float64(ns.Server.Host.MemTotal)))),
-			"#SERVER.SWAP#", mod(ns.formatUsage(true, safeDiv(float64(ns.Server.State.SwapUsed), float64(ns.Server.Host.SwapTotal)))),
-			"#SERVER.DISK#", mod(ns.formatUsage(true, safeDiv(float64(ns.Server.State.DiskUsed), float64(ns.Server.Host.DiskTotal)))),
-			"#SERVER.SPEEDIN#", mod(fmt.Sprintf("%s/s", ns.formatSize(ns.Server.State.NetInSpeed))),
-			"#SERVER.SPEEDOUT#", mod(fmt.Sprintf("%s/s", ns.formatSize(ns.Server.State.NetOutSpeed))),
-			"#SERVER.TRANSFERIN#", mod(ns.formatSize(ns.Server.State.NetInTransfer)),
-			"#SERVER.TRANSFEROUT#", mod(ns.formatSize(ns.Server.State.NetOutTransfer)),
-
-			// Raw metrics
-			"#SERVER.CPUUSED#", mod(fmt.Sprintf("%f", ns.Server.State.CPU)),
-			"#SERVER.MEMUSED#", mod(fmt.Sprintf("%d", ns.Server.State.MemUsed)),
-			"#SERVER.SWAPUSED#", mod(fmt.Sprintf("%d", ns.Server.State.SwapUsed)),
-			"#SERVER.DISKUSED#", mod(fmt.Sprintf("%d", ns.Server.State.DiskUsed)),
-			"#SERVER.MEMTOTAL#", mod(fmt.Sprintf("%d", ns.Server.Host.MemTotal)),
-			"#SERVER.SWAPTOTAL#", mod(fmt.Sprintf("%d", ns.Server.Host.SwapTotal)),
-			"#SERVER.DISKTOTAL#", mod(fmt.Sprintf("%d", ns.Server.Host.DiskTotal)),
-			"#SERVER.NETINSPEED#", mod(fmt.Sprintf("%d", ns.Server.State.NetInSpeed)),
-			"#SERVER.NETOUTSPEED#", mod(fmt.Sprintf("%d", ns.Server.State.NetOutSpeed)),
-			"#SERVER.NETINTRANSFER#", mod(fmt.Sprintf("%d", ns.Server.State.NetInTransfer)),
-			"#SERVER.NETOUTTRANSFER#", mod(fmt.Sprintf("%d", ns.Server.State.NetOutTransfer)),
-			"#SERVER.LOAD1#", mod(fmt.Sprintf("%f", ns.Server.State.Load1)),
-			"#SERVER.LOAD5#", mod(fmt.Sprintf("%f", ns.Server.State.Load5)),
-			"#SERVER.LOAD15#", mod(fmt.Sprintf("%f", ns.Server.State.Load15)),
-			"#SERVER.TCPCONNCOUNT#", mod(fmt.Sprintf("%d", ns.Server.State.TcpConnCount)),
-			"#SERVER.UDPCONNCOUNT#", mod(fmt.Sprintf("%d", ns.Server.State.UdpConnCount)),
 		)
+		if runtime.State != nil && runtime.Host != nil {
+			state := runtime.State
+			host := runtime.Host
+			replacements = append(replacements,
+				// Converted metrics
+				"#SERVER.CPU#", mod(ns.formatUsage(false, state.CPU)),
+				"#SERVER.MEM#", mod(ns.formatUsage(true, safeDiv(float64(state.MemUsed), float64(host.MemTotal)))),
+				"#SERVER.SWAP#", mod(ns.formatUsage(true, safeDiv(float64(state.SwapUsed), float64(host.SwapTotal)))),
+				"#SERVER.DISK#", mod(ns.formatUsage(true, safeDiv(float64(state.DiskUsed), float64(host.DiskTotal)))),
+				"#SERVER.SPEEDIN#", mod(fmt.Sprintf("%s/s", ns.formatSize(state.NetInSpeed))),
+				"#SERVER.SPEEDOUT#", mod(fmt.Sprintf("%s/s", ns.formatSize(state.NetOutSpeed))),
+				"#SERVER.TRANSFERIN#", mod(ns.formatSize(state.NetInTransfer)),
+				"#SERVER.TRANSFEROUT#", mod(ns.formatSize(state.NetOutTransfer)),
 
-		var ipv4, ipv6, validIP string
-		ip := ns.Server.GeoIP.IP
-		if ip.IPv4Addr != "" && ip.IPv6Addr != "" {
-			ipv4 = ip.IPv4Addr
-			ipv6 = ip.IPv6Addr
-			validIP = ipv4
-		} else if ip.IPv4Addr != "" {
-			ipv4 = ip.IPv4Addr
-			validIP = ipv4
-		} else {
-			ipv6 = ip.IPv6Addr
-			validIP = ipv6
+				// Raw metrics
+				"#SERVER.CPUUSED#", mod(fmt.Sprintf("%f", state.CPU)),
+				"#SERVER.MEMUSED#", mod(fmt.Sprintf("%d", state.MemUsed)),
+				"#SERVER.SWAPUSED#", mod(fmt.Sprintf("%d", state.SwapUsed)),
+				"#SERVER.DISKUSED#", mod(fmt.Sprintf("%d", state.DiskUsed)),
+				"#SERVER.MEMTOTAL#", mod(fmt.Sprintf("%d", host.MemTotal)),
+				"#SERVER.SWAPTOTAL#", mod(fmt.Sprintf("%d", host.SwapTotal)),
+				"#SERVER.DISKTOTAL#", mod(fmt.Sprintf("%d", host.DiskTotal)),
+				"#SERVER.NETINSPEED#", mod(fmt.Sprintf("%d", state.NetInSpeed)),
+				"#SERVER.NETOUTSPEED#", mod(fmt.Sprintf("%d", state.NetOutSpeed)),
+				"#SERVER.NETINTRANSFER#", mod(fmt.Sprintf("%d", state.NetInTransfer)),
+				"#SERVER.NETOUTTRANSFER#", mod(fmt.Sprintf("%d", state.NetOutTransfer)),
+				"#SERVER.LOAD1#", mod(fmt.Sprintf("%f", state.Load1)),
+				"#SERVER.LOAD5#", mod(fmt.Sprintf("%f", state.Load5)),
+				"#SERVER.LOAD15#", mod(fmt.Sprintf("%f", state.Load15)),
+				"#SERVER.TCPCONNCOUNT#", mod(fmt.Sprintf("%d", state.TcpConnCount)),
+				"#SERVER.UDPCONNCOUNT#", mod(fmt.Sprintf("%d", state.UdpConnCount)),
+			)
 		}
 
-		replacements = append(replacements,
-			"#SERVER.IP#", mod(validIP),
-			"#SERVER.IPV4#", mod(ipv4),
-			"#SERVER.IPV6#", mod(ipv6),
-		)
+		var ipv4, ipv6, validIP string
+		if ns.Server.GeoIP != nil {
+			ip := ns.Server.GeoIP.IP
+			if ip.IPv4Addr != "" && ip.IPv6Addr != "" {
+				ipv4 = ip.IPv4Addr
+				ipv6 = ip.IPv6Addr
+				validIP = ipv4
+			} else if ip.IPv4Addr != "" {
+				ipv4 = ip.IPv4Addr
+				validIP = ipv4
+			} else {
+				ipv6 = ip.IPv6Addr
+				validIP = ipv6
+			}
+
+			replacements = append(replacements,
+				"#SERVER.IP#", mod(validIP),
+				"#SERVER.IPV4#", mod(ipv4),
+				"#SERVER.IPV6#", mod(ipv6),
+			)
+		}
 	}
 
 	replacer := strings.NewReplacer(replacements...)

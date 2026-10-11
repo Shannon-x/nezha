@@ -1,6 +1,7 @@
 package singleton
 
 import (
+	"errors"
 	"log"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 
 // TSDBShared 全局 TSDB 存储实例（Store 接口）
 var TSDBShared tsdb.Store
+
+var openTSDB = tsdb.Open
 
 // InitTSDB 初始化 TSDB
 // 策略：
@@ -71,11 +74,17 @@ func initVMStore(config *tsdb.Config) error {
 		config.MaxMemoryMB = Conf.TSDB.MaxMemoryMB
 	}
 
-	var err error
-	TSDBShared, err = tsdb.Open(config)
+	TSDBShared = nil
+	db, err := openTSDB(config)
 	if err != nil {
+		if errors.Is(err, tsdb.ErrDiskFull) {
+			// service_histories 表已在 InitDB 中迁移，可直接作为回退存储。
+			log.Printf("NEZHA>> Warning: TSDB is unavailable because its disk is full; dashboard and alerts will continue without TSDB writes: %v", err)
+			return nil
+		}
 		return err
 	}
+	TSDBShared = db
 	log.Println("NEZHA>> TSDB initialized in VictoriaMetrics mode")
 	return nil
 }
