@@ -205,7 +205,15 @@ func (s *NezhaHandler) ReportSystemState(stream pb.NezhaService_ReportSystemStat
 		return errors.New("server not found")
 	}
 	lease := server.AttachStateStream(stream)
-	defer lease.Clear()
+	defer func() {
+		// Persist while owning the lease; a replaced stream must never close a
+		// newer stream's session between Clear and RecordOffline.
+		lease.ClearWithSideEffect(func() {
+			if singleton.OnlineHistoryShared != nil {
+				singleton.OnlineHistoryShared.RecordOffline(clientID, time.Now())
+			}
+		})
+	}()
 	var state *pb.State
 	var stateCount uint64
 	// TSDB 写入节流：每台服务器每分钟最多写一条指标。该变量只在本 stream 的
@@ -259,6 +267,9 @@ func (s *NezhaHandler) ReportSystemState(stream pb.NezhaService_ReportSystemStat
 				}); err != nil {
 					log.Printf("NEZHA>> Failed to write server metrics to TSDB: %v", err)
 				}
+			}
+			if singleton.OnlineHistoryShared != nil {
+				singleton.OnlineHistoryShared.RecordOnline(clientID, lastActive)
 			}
 			return nil
 		})

@@ -67,6 +67,7 @@ func LoadSingleton(bus chan<- *model.Service) (err error) {
 	ServerShared = NewServerClass()
 	CronShared = NewCronClass()
 	ServerTransferShared = NewServerTransferClass()
+	OnlineHistoryShared = NewOnlineHistoryRecorder()
 	// 最后初始化 ServiceSentinel
 	ServiceSentinelShared, err = NewServiceSentinel(bus)
 	return
@@ -147,7 +148,7 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
 		model.NAT{}, model.DDNSProfile{}, model.NotificationGroupNotification{},
 		model.WAF{}, model.Oauth2Bind{}, model.ServerTransfer{}, model.JWTSession{},
-		model.APIToken{}, model.MCPAuditLog{})
+		model.APIToken{}, model.MCPAuditLog{}, model.OnlineSession{})
 	if err != nil {
 		return fmt.Errorf("failed to auto-migrate database: %w", err)
 	}

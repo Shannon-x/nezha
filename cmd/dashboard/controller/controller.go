@@ -103,6 +103,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	// 拉取服务器维度的服务历史，与 /server/:id/service 复用同一实现。
 	optionalAuth.GET("/service/:id", restScopeMiddleware(model.ScopeServiceRead), commonHandler(listServerServices))
 	optionalAuth.GET("/server/:id/metrics", restScopeMiddleware(model.ScopeServerRead), commonHandler(getServerMetrics))
+	optionalAuth.GET("/server/:id/online-history", restScopeMiddleware(model.ScopeServerRead), commonHandler(getServerOnlineHistory))
 
 	// CSRF middleware applies group-wide. Safe methods short-circuit and
 	// PAT bearer requests bypass — so the only callers gated are
