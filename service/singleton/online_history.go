@@ -271,12 +271,17 @@ func PruneOnlineSessions() {
 	}
 	cutoff := model.OnlineHistoryWindowStart(time.Now(), keepDays, Loc)
 	pruneOnlineSessionsBatch("ongoing = ? AND ended_at < ?", false, cutoff)
-	pruneOnlineSessionsBatch("server_id NOT IN (SELECT `id` FROM servers)")
+	// 不加反引号：PostgreSQL / SQL Server 不认 MySQL 风格的标识符引号
+	pruneOnlineSessionsBatch("server_id NOT IN (SELECT id FROM servers)")
 }
 
 // pruneOnlineSessionsBatch 按主键分批删除匹配的行，每批之间释放写锁。
 func pruneOnlineSessionsBatch(where string, args ...any) {
-	const batchSize = 10000
+	batchSize := 10000
+	// SQL Server 单条语句最多 2100 个参数，按主键 IN 删除时需缩小批次
+	if DB.Dialector.Name() == "sqlserver" {
+		batchSize = 2000
+	}
 	for {
 		var ids []uint64
 		if err := DB.Model(&model.OnlineSession{}).Unscoped().
