@@ -105,6 +105,44 @@ database:
 | `NZ_DATABASE_SSLMODE` | SSL 模式 (PostgreSQL) | `disable`, `require` |
 | `NZ_DATABASE_PATH` | SQLite 文件路径 | `data/sqlite.db` |
 
+## 安全加固 | Security Hardening
+
+agent 以 root / SYSTEM 运行。面板一旦失守（弱口令、泄露的 JWT 或 API Token、面板漏洞），攻击者就能通过面板控制所有被监控的服务器。本 fork 增加了以下防护：
+
+### 面板侧高危能力锁
+
+在 `config.yaml` 中关闭不需要的能力。这些开关只能通过配置文件或环境变量设置，网页和 API 无法修改，因此即使面板账号被盗也无法重新打开：
+
+```yaml
+security:
+  disable_command_execute: true   # 批量 / 计划任务执行命令、MCP exec
+  disable_terminal: true          # WebSSH 终端
+  disable_file_manager: true      # 文件管理、MCP 文件读写与传输
+  disable_agent_config: true      # 远程查看 / 修改 agent 配置
+  disable_server_transfer: true   # 服务器迁移
+  disable_agent_upgrade: false    # 远程强制升级 agent
+  disable_nat: true               # 内网穿透
+```
+
+环境变量写法去掉键名中的下划线，例如 `NZ_SECURITY_DISABLECOMMANDEXECUTE=true`。
+
+### agent 侧（最终防线）
+
+即使面板被完全攻破，agent 自己的开关也无法被面板远程改回。建议每台服务器的 agent 配置：
+
+```yaml
+disable_command_execute: true   # 拒绝命令、终端、文件管理、远程改配置
+disable_nat: true               # 拒绝内网穿透
+disable_force_update: true      # 拒绝面板强制升级
+tls: true                       # 与面板之间加密传输
+```
+
+### 其他
+
+- 空数据库初始化时不再使用 `admin/admin`，改为随机密码并打印在启动日志中；也可以用环境变量 `NZ_ADMIN_PASSWORD` 指定。
+- 每次启动都会进行安全自检：弱口令、过短的密钥、过宽的配置文件权限（自动收紧为 0600）。同时列出全部用户、API Token、计划任务和内网穿透，便于发现异常。
+- 面板只通过 HTTPS（或 HTTPS 反向代理）访问，最好再加 IP 白名单或 Cloudflare Access 等前置认证；使用 OAuth2 时务必设置 `dashboard_host`。
+
 ## Contributing
 
 ### Translation

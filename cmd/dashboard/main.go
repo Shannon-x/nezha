@@ -70,9 +70,18 @@ func initSystem(bus chan<- *model.Service) error {
 	// Dashboard. Replacing it requires a coordinated installer/migration flow so
 	// existing unattended installations are not locked out.
 	if usersCount == 0 {
-		hash, err := bcrypt.GenerateFromPassword([]byte("admin"), bcrypt.DefaultCost)
+		// fork: 不再使用 admin/admin，改为 NZ_ADMIN_PASSWORD 或随机密码
+		password, generated, err := singleton.BootstrapAdminPassword()
 		if err != nil {
 			return err
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if err != nil {
+			return err
+		}
+		if generated {
+			log.Printf("NEZHA>> ======== 初始管理员账号：admin  密码：%s ========", password)
+			log.Printf("NEZHA>> 该密码只在首次初始化时显示一次，请登录后立即修改")
 		}
 		admin := model.User{
 			Username: "admin",
@@ -86,6 +95,8 @@ func initSystem(bus chan<- *model.Service) error {
 	if err := singleton.LoadSingleton(bus); err != nil {
 		return err
 	}
+	// fork: 启动安全自检（bcrypt 校验较慢，异步执行不拖慢启动）
+	go singleton.RunSecurityAudit(dashboardCliParam.ConfigFile)
 
 	if _, err := singleton.CronShared.AddFunc("0 30 3 * * *", singleton.CleanMonitorHistory); err != nil {
 		return err

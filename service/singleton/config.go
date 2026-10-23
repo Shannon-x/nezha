@@ -40,6 +40,8 @@ func InitConfigFromPath(path string) error {
 
 	Conf.updateIgnoredIPNotificationID()
 	Conf.Oauth2Providers = utils.MapKeysToSlice(Conf.Oauth2)
+	// fork: 面板侧高危能力锁
+	model.ApplySecurityPolicy(Conf.Security)
 	return nil
 }
 

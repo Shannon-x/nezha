@@ -163,6 +163,8 @@ func dashboardEnvironment(enableTLS bool, receiptGateOption ...bool) []string {
 	}
 	environment = append(environment,
 		"NZ_JWTSECRETKEY="+jwtSecret,
+		// fork 的空库初始化不再默认 admin/admin，测试显式指定
+		"NZ_ADMIN_PASSWORD=admin",
 		"NEZHA_AGENTCOMPAT_HTTP_LISTENER_FD=3",
 	)
 	if receiptGate {

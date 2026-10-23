@@ -198,6 +198,9 @@ type Config struct {
 	// 环境变量优先于配置文件 (Environment variables take priority)
 	Database DatabaseConfig `koanf:"database" json:"database"`
 
+	// 面板侧高危能力锁，只能通过配置文件 / 环境变量设置
+	Security SecurityConf `koanf:"security" json:"security"`
+
 	k        *koanf.Koanf `json:"-"`
 	filePath string       `json:"-"`
 }

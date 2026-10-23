@@ -296,6 +296,10 @@ func (s *Server) GetTaskStream() pb.NezhaService_RequestTaskServer {
 // edit/transfer rotations replacing *Server in the singleton map still share
 // a single lock across the old and new objects pointing at the same stream.
 func (s *Server) SendTask(task *pb.Task) error {
+	// fork: 面板侧高危能力锁，所有下发路径（网页、API、MCP、计划任务）都经过这里
+	if err := CheckTaskAllowed(task.GetType()); err != nil {
+		return err
+	}
 	h := s.taskStream.Load()
 	if h == nil {
 		return ErrTaskStreamOffline
