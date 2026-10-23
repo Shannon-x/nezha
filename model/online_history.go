@@ -34,13 +34,51 @@ type OnlineSession struct {
 	Ongoing      bool      `gorm:"index:idx_online_sessions_server_closed,priority:2;index:idx_online_sessions_server_open,priority:2" json:"ongoing"`
 }
 
+// onlineSessionUnsetTime 在 MySQL 上代替 Go 零值时间落库。MySQL 5.7+ 默认
+// sql_mode 含 NO_ZERO_DATE，驱动把零值写成 '0000-00-00' 会被拒绝
+// (Error 1292)，进行中会话的 EndedAt 正是零值。取一个真实数据不可能出现的
+// 早期时间，读出时还原为零值，业务代码仍按 IsZero 判断。
+var onlineSessionUnsetTime = time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC)
+
+func (s *OnlineSession) timeFields() []*time.Time {
+	return []*time.Time{&s.StartedAt, &s.EndedAt, &s.LastActiveAt}
+}
+
 // BeforeSave keeps SQLite's lexicographic timestamp comparisons chronological.
 // Query parameters and map-based updates must use UTC as well.
-func (s *OnlineSession) BeforeSave(_ *gorm.DB) error {
+func (s *OnlineSession) BeforeSave(tx *gorm.DB) error {
 	s.StartedAt = s.StartedAt.UTC()
 	s.EndedAt = s.EndedAt.UTC()
 	s.LastActiveAt = s.LastActiveAt.UTC()
+	if tx != nil && tx.Dialector != nil && tx.Dialector.Name() == "mysql" {
+		for _, t := range s.timeFields() {
+			if t.IsZero() {
+				*t = onlineSessionUnsetTime
+			}
+		}
+	}
 	return nil
+}
+
+// AfterSave 与 AfterFind 把 MySQL 上的占位时间还原为零值。
+func (s *OnlineSession) AfterSave(_ *gorm.DB) error {
+	s.restoreUnsetTimes()
+	return nil
+}
+
+func (s *OnlineSession) AfterFind(_ *gorm.DB) error {
+	s.restoreUnsetTimes()
+	return nil
+}
+
+func (s *OnlineSession) restoreUnsetTimes() {
+	// 留出两天余量，容纳驱动按 loc 换算时区造成的偏移
+	limit := onlineSessionUnsetTime.Add(48 * time.Hour)
+	for _, t := range s.timeFields() {
+		if !t.IsZero() && t.Before(limit) {
+			*t = time.Time{}
+		}
+	}
 }
 
 // OnlinePeriod 是裁剪到查询窗口后的在线时间段，供前端时间轴直接渲染。
