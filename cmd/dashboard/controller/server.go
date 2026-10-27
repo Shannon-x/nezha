@@ -200,9 +200,11 @@ func forceUpdateServer(c *gin.Context) (*model.ServerTaskResponse, error) {
 			continue
 		}
 		if server.GetTaskStream() != nil {
-			if err := server.SendTask(&pb.Task{
+			// Upgrade is a control operation too; recheck ownership and pending
+			// transitions at the actual send, including timeout cleanup.
+			if err := server.SendTaskGuarded(&pb.Task{
 				Type: model.TaskTypeUpgrade,
-			}); err != nil {
+			}, serverTaskAdmission(c, sid)); err != nil {
 				if errors.Is(err, model.ErrTaskStreamOffline) {
 					forceUpdateResp.Offline = append(forceUpdateResp.Offline, sid)
 				} else {
@@ -241,13 +243,18 @@ func getServerConfig(c *gin.Context) (string, error) {
 	if !ok || !s.HasPermission(c) || !patAllowsServer(c, id) {
 		return "", singleton.Localizer.ErrorT("permission denied")
 	}
+	releaseControl, controlErr := beginServerControl(c, id)
+	if controlErr != nil {
+		return "", controlErr
+	}
+	releaseControl() // Waiting for ConfigCache must not block ownership rollback.
 	if s.GetTaskStream() == nil {
 		return "", nil
 	}
 
-	if err := s.SendTask(&pb.Task{
+	if err := s.SendTaskGuarded(&pb.Task{
 		Type: model.TaskTypeReportConfig,
-	}); err != nil {
+	}, serverTaskAdmission(c, id)); err != nil {
 		if errors.Is(err, model.ErrTaskStreamOffline) {
 			return "", nil
 		}
@@ -255,11 +262,13 @@ func getServerConfig(c *gin.Context) (string, error) {
 	}
 
 	timeout := time.NewTimer(time.Second * 10)
+	defer timeout.Stop()
 	select {
+	case <-c.Request.Context().Done():
+		return "", c.Request.Context().Err()
 	case <-timeout.C:
 		return "", singleton.Localizer.ErrorT("operation timeout")
 	case data := <-s.ConfigCache:
-		timeout.Stop()
 		switch data := data.(type) {
 		case string:
 			return data, nil
@@ -325,7 +334,10 @@ func setServerConfig(c *gin.Context) (*model.ServerTaskResponse, error) {
 					respMu.Unlock()
 					continue
 				}
-				if err := s.SendTask(task); err != nil {
+				// The transport can still be sending after its deadline returns.
+				// Keep ownership admission with the actual Send, not the HTTP call.
+				sendErr := s.SendTaskGuarded(task, serverTaskAdmission(c, s.ID))
+				if err := sendErr; err != nil {
 					respMu.Lock()
 					if errors.Is(err, model.ErrTaskStreamOffline) {
 						resp.Offline = append(resp.Offline, s.ID)

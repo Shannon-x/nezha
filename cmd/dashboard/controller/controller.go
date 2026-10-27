@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	jwt "github.com/appleboy/gin-jwt/v2"
 	"github.com/gin-contrib/pprof"
@@ -27,7 +29,8 @@ import (
 
 func ServeWeb(frontendDist fs.FS) http.Handler {
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.Default()
+	r := gin.New()
+	r.Use(dashboardRequestLogger(), dashboardRecovery())
 
 	if singleton.Conf.Debug {
 		gin.SetMode(gin.DebugMode)
@@ -60,11 +63,19 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	// Signature-only view of the auth middleware for IsDashboardCredential:
 	// same key and pinned algorithm, claims validation deliberately skipped.
 	dashboardCredentialJWTParser = newDashboardCredentialJWTParser(authMiddleware)
-	// /mcp — Model Context Protocol endpoint, authenticated by PAT only (闸 1 + 闸 2)。
+	// /mcp accepts PAT or MCP-only OAuth credentials (闸 1 + 闸 2).
 	// 不放在 /api/v1 下：MCP client 配置 URL 更短，且 MCP transport 协议演进与 REST API
-	// 解耦。鉴权一律走 apiTokenAuthMiddleware；不接受 JWT 以避免浏览器误触。
+	// 解耦。两种凭据共享权限身份；不接受 JWT 以避免浏览器误触。
 	// mcpOriginGuard 防止 DNS rebinding / 浏览器跨站调用。
-	r.POST("/mcp", mcpOriginGuard(), apiTokenAuthMiddleware(), mcpEndpoint)
+	registerMCPOAuthRoutes(r)
+	r.GET(mcpOAuthFrontendPath, func(c *gin.Context) {
+		// OAuth consent must not be embedded by another site for clickjacking.
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Content-Security-Policy", "frame-ancestors 'none'")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Next()
+	}, fallbackToFrontend(frontendDist))
+	r.POST("/mcp", mcpOriginGuard(), mcpOAuthAccessAuth, apiTokenAuthMiddleware(), mcpEndpoint)
 	// Streamable HTTP 规范要求：不实现 standalone SSE / session 时，GET / DELETE
 	// 必须显式返回 405，让客户端走 POST-only 路径并跳过 session 终止流程。
 	// 不显式注册时，Gin 会走 NoRoute → fallbackToFrontend，对 MCP 客户端是 HTML/404。
@@ -76,10 +87,11 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 
 	api := r.Group("api/v1")
 	api.POST("/login", authMiddleware.LoginHandler)
-	api.GET("/oauth2/:provider", commonHandler(oauth2redirect))
 
 	fallbackAuthMw := fallbackAuthMiddleware(authMiddleware)
 	fallbackAuth := api.Group("", fallbackAuthMw)
+	// Binding needs the real JWT session; anonymous OAuth login remains available.
+	fallbackAuth.GET("/oauth2/:provider", commonHandler(oauth2redirect))
 	fallbackAuth.GET("/setting", commonHandler(listConfig))
 	fallbackAuth.GET("/oauth2/callback", commonHandler(oauth2callback(authMiddleware)))
 
@@ -116,6 +128,14 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.GET("/profile", patForbidden, commonHandler(getProfile))
 	auth.POST("/profile", patForbidden, commonHandler(updateProfile))
 	auth.POST("/oauth2/:provider/unbind", patForbidden, commonHandler(unbindOauth2))
+	auth.GET("/mcp/oauth/consent", patForbidden, mcpOAuthAvailable, commonHandler(mcpOAuthConsentInfo))
+	auth.POST("/mcp/oauth/consent", patForbidden, mcpOAuthAvailable, commonHandler(mcpOAuthConsent))
+	// Management remains available when MCP is off so users can still revoke access.
+	mcpOAuthManagement := auth.Group("/mcp/oauth", patForbidden, mcpOAuthManagementHeaders)
+	mcpOAuthManagement.GET("/grants", commonHandler(listMCPOAuthGrants))
+	mcpOAuthManagement.DELETE("/grants/:id", commonHandler(revokeMCPOAuthGrant))
+	mcpOAuthManagement.GET("/clients", adminHandler(listMCPOAuthClients))
+	mcpOAuthManagement.PUT("/clients/:id", adminHandler(updateMCPOAuthClient))
 	auth.GET("/api-tokens", patForbidden, commonHandler(listAPITokens))
 	auth.POST("/api-tokens", patForbidden, commonHandler(createAPIToken))
 	auth.DELETE("/api-tokens/:id", patForbidden, commonHandler(deleteAPIToken))
@@ -197,6 +217,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.POST("/online-user/batch-block", restScopeMiddleware(model.ScopeAdminAll), adminHandler(batchBlockOnlineUser))
 	auth.PATCH("/setting", restScopeMiddleware(model.ScopeAdminAll), adminHandler(updateConfig))
 	auth.POST("/maintenance", restScopeMiddleware(model.ScopeAdminAll), adminHandler(runMaintenance))
+	registerFrontendRoutes(auth)
 
 	r.NoRoute(fallbackToFrontend(frontendDist))
 }
@@ -364,7 +385,7 @@ func getUid(c *gin.Context) uint64 {
 }
 
 func fallbackToFrontend(frontendDist fs.FS) func(*gin.Context) {
-	serveFile := func(c *gin.Context, name string, file fs.File, customStatusCode int) bool {
+	serveFile := func(c *gin.Context, name string, file fs.File, customStatusCode int, installation string) bool {
 		defer file.Close()
 		fileStat, err := file.Stat()
 		if err != nil {
@@ -377,17 +398,45 @@ func fallbackToFrontend(frontendDist fs.FS) func(*gin.Context) {
 		if !ok {
 			return false
 		}
-		http.ServeContent(utils.NewGinCustomWriter(c, customStatusCode), c.Request, name, fileStat.ModTime(), readSeeker)
+		modified := fileStat.ModTime()
+		if name == "index.html" {
+			c.Header("Cache-Control", "no-store")
+			// Two frontend installs can share a timestamp; never answer 304 with
+			// the previous frontend's HTML after a runtime switch.
+			modified = time.Time{}
+		} else if installation != "" {
+			// Installed directories are immutable. Bind validation to the install,
+			// not timestamps: switching to an older release must not reuse newer JS.
+			etag := sha256.Sum256([]byte(installation + "\x00" + name))
+			c.Header("ETag", fmt.Sprintf(`"%x"`, etag))
+			c.Header("Cache-Control", "no-cache")
+			modified = time.Time{}
+		}
+		var writer http.ResponseWriter = c.Writer
+		// Only override the status for SPA error pages. Rewriting a real asset's
+		// 304 or 206 to 200 corrupts browser cache or partial-content responses.
+		if customStatusCode != http.StatusOK {
+			writer = utils.NewGinCustomWriter(c, customStatusCode)
+		}
+		http.ServeContent(writer, c.Request, name, modified, readSeeker)
 		return true
 	}
 
 	checkLocalFileOrFs := func(c *gin.Context, frontendFS fs.FS, templateRoot, filePath string, customStatusCode int) bool {
 		if filePath != "" {
-			localRoot, err := os.OpenRoot(templateRoot)
+			localDirectory := templateRoot
+			var installation string
+			if singleton.Conf.FrontendStore != nil {
+				localDirectory = singleton.Conf.FrontendStore.Directory(templateRoot)
+				if localDirectory != templateRoot {
+					installation = templateRoot
+				}
+			}
+			localRoot, err := os.OpenRoot(localDirectory)
 			if err == nil {
 				defer localRoot.Close()
 				// URL paths must stay inside the selected template root; never join them against the process cwd.
-				if file, err := localRoot.Open(filePath); err == nil && serveFile(c, filePath, file, customStatusCode) {
+				if file, err := localRoot.Open(filePath); err == nil && serveFile(c, filePath, file, customStatusCode, installation) {
 					return true
 				}
 			}
@@ -404,7 +453,7 @@ func fallbackToFrontend(frontendDist fs.FS) func(*gin.Context) {
 		if err != nil {
 			return false
 		}
-		if serveFile(c, filePath, file, customStatusCode) {
+		if serveFile(c, filePath, file, customStatusCode, "") {
 			return true
 		}
 		return false
@@ -431,6 +480,9 @@ func fallbackToFrontend(frontendDist fs.FS) func(*gin.Context) {
 		regexp.MustCompile(`^/dashboard/settings/online-user$`),
 		regexp.MustCompile(`^/dashboard/settings/waf$`),
 		regexp.MustCompile(`^/dashboard/settings/api-tokens$`),
+		regexp.MustCompile(`^/dashboard/settings/mcp-oauth$`),
+		regexp.MustCompile(`^/dashboard/mcp/authorize$`),
+		regexp.MustCompile(`^/dashboard/settings/frontends$`),
 		// 注意：这里的白名单决定哪些 URL 走 index.html fallback；漏一条就会把
 		// 直接刷新该页面变成 404（HTTP 状态码层面，body 仍是 index.html，所以
 		// 浏览器内 SPA 看起来正常，但 monitoring / 链接预览会以为站点挂了）。
@@ -460,22 +512,23 @@ func fallbackToFrontend(frontendDist fs.FS) func(*gin.Context) {
 		}
 
 		fallbackStatusCode := getFallbackStatusCode(c.Request.URL.Path)
+		userTemplate, adminTemplate := singleton.Conf.FrontendSelection()
 		// Only /dashboard/ belongs to the admin frontend; /dashboard.. must not be trimmed into ../.
 		if strings.HasPrefix(c.Request.URL.Path, "/dashboard/") {
 			stripPath := strings.TrimPrefix(c.Request.URL.Path, "/dashboard/")
-			if checkLocalFileOrFs(c, frontendDist, singleton.Conf.AdminTemplate, stripPath, http.StatusOK) {
+			if checkLocalFileOrFs(c, frontendDist, adminTemplate, stripPath, http.StatusOK) {
 				return
 			}
-			if !checkLocalFileOrFs(c, frontendDist, singleton.Conf.AdminTemplate, "index.html", fallbackStatusCode) {
+			if !checkLocalFileOrFs(c, frontendDist, adminTemplate, "index.html", fallbackStatusCode) {
 				c.JSON(http.StatusNotFound, newErrorResponse(errors.New("404 Not Found")))
 			}
 			return
 		}
 		stripPath := strings.TrimPrefix(c.Request.URL.Path, "/")
-		if checkLocalFileOrFs(c, frontendDist, singleton.Conf.UserTemplate, stripPath, http.StatusOK) {
+		if checkLocalFileOrFs(c, frontendDist, userTemplate, stripPath, http.StatusOK) {
 			return
 		}
-		if !checkLocalFileOrFs(c, frontendDist, singleton.Conf.UserTemplate, "index.html", fallbackStatusCode) {
+		if !checkLocalFileOrFs(c, frontendDist, userTemplate, "index.html", fallbackStatusCode) {
 			c.JSON(http.StatusNotFound, newErrorResponse(errors.New("404 Not Found")))
 		}
 	}

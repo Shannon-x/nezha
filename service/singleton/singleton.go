@@ -148,7 +148,8 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
 		model.NAT{}, model.DDNSProfile{}, model.NotificationGroupNotification{},
 		model.WAF{}, model.Oauth2Bind{}, model.ServerTransfer{}, model.JWTSession{},
-		model.APIToken{}, model.MCPAuditLog{}, model.OnlineSession{})
+		model.APIToken{}, model.MCPAuditLog{}, model.OnlineSession{},
+		model.MCPOAuthClient{}, model.MCPOAuthCode{}, model.MCPOAuthGrant{})
 	if err != nil {
 		return fmt.Errorf("failed to auto-migrate database: %w", err)
 	}
@@ -216,6 +217,10 @@ func PersistTransfer(transfer model.Transfer) error {
 
 // CleanMonitorHistory 清理流量记录（TSDB 有自己的保留策略）
 func CleanMonitorHistory() {
+	// Audit retention is finite even when MCP was subsequently disabled.
+	if err := DB.Where("created_at < ?", time.Now().AddDate(0, 0, -90)).Delete(&model.MCPAuditLog{}).Error; err != nil {
+		log.Printf("NEZHA>> audit retention cleanup: %v", err)
+	}
 	thirtyDaysAgo := time.Now().AddDate(0, 0, -30)
 	oneDayAgo := time.Now().AddDate(0, 0, -1)
 
@@ -254,7 +259,10 @@ func CleanMonitorHistory() {
 				}
 			} else {
 				// 更新特定机器可以清理数据点
-				for id := range rule.Ignore {
+				for id, included := range rule.Ignore {
+					if !included {
+						continue
+					}
 					if specialServerKeep[id].IsZero() || specialServerKeep[id].After(dataCouldRemoveBefore) {
 						specialServerKeep[id] = dataCouldRemoveBefore
 						specialServerIDs = append(specialServerIDs, id)
@@ -264,20 +272,24 @@ func CleanMonitorHistory() {
 		}
 	}
 	for id, couldRemove := range specialServerKeep {
-		DB.Unscoped().Delete(&model.Transfer{}, "server_id = ? AND created_at < ?", id, couldRemove)
+		// Retain history required by either a global or server-specific rule.
+		if !allServerKeep.IsZero() && allServerKeep.Before(couldRemove) {
+			couldRemove = allServerKeep
+		}
+		DB.Unscoped().Delete(&model.Transfer{}, "server_id = ? AND "+model.TimeCompareExpr(DB, "created_at", "<"), id, couldRemove)
 	}
 	if len(specialServerIDs) == 0 {
 		if allServerKeep.IsZero() {
 			DB.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.Transfer{})
 		} else {
-			DB.Unscoped().Delete(&model.Transfer{}, "created_at < ?", allServerKeep)
+			DB.Unscoped().Delete(&model.Transfer{}, model.TimeCompareExpr(DB, "created_at", "<"), allServerKeep)
 		}
 		return
 	}
 	if allServerKeep.IsZero() {
 		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?)", specialServerIDs)
 	} else {
-		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?) AND created_at < ?", specialServerIDs, allServerKeep)
+		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?) AND "+model.TimeCompareExpr(DB, "created_at", "<"), specialServerIDs, allServerKeep)
 	}
 }
 

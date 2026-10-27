@@ -281,11 +281,13 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 					if cronShared != nil {
 						cronShared.reserveAlertTriggerCronResult(cr.ID, s.ID)
 					}
-					if err := s.SendTask(&pb.Task{
+					// An alert command can still be sending after timeout. Keep
+					// its control lease until the actual transport send exits.
+					if err := s.SendTaskGuarded(&pb.Task{
 						Id:   cr.ID,
 						Data: cr.Command,
 						Type: model.TaskTypeCommand,
-					}); err != nil && cronShared != nil {
+					}, ServerTaskAdmission(s.ID, cr.UserID)); err != nil && cronShared != nil {
 						cronShared.revokeAlertTriggerCronResult(cr.ID, s.ID)
 					}
 				} else {
@@ -315,11 +317,11 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 				continue
 			}
 			if s.GetTaskStream() != nil {
-				_ = s.SendTask(&pb.Task{
+				_ = s.QueueTaskGuarded(&pb.Task{
 					Id:   cr.ID,
 					Data: cr.Command,
 					Type: model.TaskTypeCommand,
-				})
+				}, ServerTaskAdmission(s.ID, cr.UserID))
 			} else {
 				// 保存当前服务器状态信息
 				curServer := model.Server{}
