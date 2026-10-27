@@ -217,7 +217,7 @@ func (u *Rule) EvaluateRuntime(cycleTransferStats *CycleTransferStats, server *S
 		src = float64(utils.SubUintChecked(state.NetInTransfer, runtime.PrevTransferInSnapshot))
 		if u.CycleInterval != 0 {
 			var res NResult
-			if err := db.Model(&Transfer{}).Select("SUM(`in`) AS n").Where("datetime(`created_at`) >= datetime(?) AND datetime(`created_at`) < datetime(?) AND datetime(`created_at`) <= datetime(?) AND server_id = ?", cycleStart.UTC(), cycleEnd.UTC(), evalNow.UTC(), server.ID).Scan(&res).Error; err != nil {
+			if err := db.Model(&Transfer{}).Select(sumColumnsExpr(db, "in")).Where(cycleTransferWhere(db), cycleStart.UTC(), cycleEnd.UTC(), evalNow.UTC(), server.ID).Scan(&res).Error; err != nil {
 				log.Printf("NEZHA>> Alert cycle transfer query failed for rule %s server %d: %v", u.Type, server.ID, err)
 				return true, false
 			}
@@ -230,7 +230,7 @@ func (u *Rule) EvaluateRuntime(cycleTransferStats *CycleTransferStats, server *S
 		src = float64(utils.SubUintChecked(state.NetOutTransfer, runtime.PrevTransferOutSnapshot))
 		if u.CycleInterval != 0 {
 			var res NResult
-			if err := db.Model(&Transfer{}).Select("SUM(`out`) AS n").Where("datetime(`created_at`) >= datetime(?) AND datetime(`created_at`) < datetime(?) AND datetime(`created_at`) <= datetime(?) AND server_id = ?", cycleStart.UTC(), cycleEnd.UTC(), evalNow.UTC(), server.ID).Scan(&res).Error; err != nil {
+			if err := db.Model(&Transfer{}).Select(sumColumnsExpr(db, "out")).Where(cycleTransferWhere(db), cycleStart.UTC(), cycleEnd.UTC(), evalNow.UTC(), server.ID).Scan(&res).Error; err != nil {
 				log.Printf("NEZHA>> Alert cycle transfer query failed for rule %s server %d: %v", u.Type, server.ID, err)
 				return true, false
 			}
@@ -243,7 +243,7 @@ func (u *Rule) EvaluateRuntime(cycleTransferStats *CycleTransferStats, server *S
 		src = float64(utils.SubUintChecked(state.NetOutTransfer, runtime.PrevTransferOutSnapshot) + utils.SubUintChecked(state.NetInTransfer, runtime.PrevTransferInSnapshot))
 		if u.CycleInterval != 0 {
 			var res NResult
-			if err := db.Model(&Transfer{}).Select("SUM(`in`+`out`) AS n").Where("datetime(`created_at`) >= datetime(?) AND datetime(`created_at`) < datetime(?) AND datetime(`created_at`) <= datetime(?) AND server_id = ?", cycleStart.UTC(), cycleEnd.UTC(), evalNow.UTC(), server.ID).Scan(&res).Error; err != nil {
+			if err := db.Model(&Transfer{}).Select(sumColumnsExpr(db, "in", "out")).Where(cycleTransferWhere(db), cycleStart.UTC(), cycleEnd.UTC(), evalNow.UTC(), server.ID).Scan(&res).Error; err != nil {
 				log.Printf("NEZHA>> Alert cycle transfer query failed for rule %s server %d: %v", u.Type, server.ID, err)
 				return true, false
 			}

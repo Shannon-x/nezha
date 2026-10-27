@@ -117,7 +117,8 @@ func (c *ConfigClass) SettingsSnapshot() model.Setting {
 }
 
 func (c *ConfigClass) AvailableFrontendTemplates() []model.FrontendTemplate {
-	if c.FrontendStore != nil {
+	// fork: security.disable_frontend_install 时只提供内置前端
+	if c.FrontendStore != nil && !c.Security.DisableFrontendInstall {
 		return c.FrontendStore.Templates()
 	}
 	return append([]model.FrontendTemplate(nil), FrontendTemplates...)
@@ -126,7 +127,20 @@ func (c *ConfigClass) AvailableFrontendTemplates() []model.FrontendTemplate {
 func (c *ConfigClass) FrontendSelection() (user, admin string) {
 	c.frontendSelectionMu.RLock()
 	defer c.frontendSelectionMu.RUnlock()
+	if c.Security.DisableFrontendInstall {
+		// fork: 第三方前端被锁定时退回内置前端
+		return builtinFrontendOr(c.UserTemplate, "user-dist", false), builtinFrontendOr(c.AdminTemplate, "admin-dist", true)
+	}
 	return c.UserTemplate, c.AdminTemplate
+}
+
+func builtinFrontendOr(path, fallback string, isAdmin bool) string {
+	for _, t := range FrontendTemplates {
+		if t.Path == path && t.IsAdmin == isAdmin {
+			return path
+		}
+	}
+	return fallback
 }
 
 // CommitFrontendSelection publishes the selection only after persistence succeeds.

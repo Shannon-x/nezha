@@ -28,6 +28,10 @@ type SecurityConf struct {
 	DisableAgentUpgrade bool `koanf:"disable_agent_upgrade" json:"disable_agent_upgrade,omitempty"`
 	// 内网穿透（经面板访问 agent 本机或内网服务）
 	DisableNAT bool `koanf:"disable_nat" json:"disable_nat,omitempty"`
+	// 在线安装第三方前端。前端 JS 运行在每个访问者（含管理员）的浏览器里，
+	// 管理员账号失守时可被用来植入恶意页面窃取登录态。开启后只能使用内置前端，
+	// 已安装的第三方前端会自动退回内置前端。
+	DisableFrontendInstall bool `koanf:"disable_frontend_install" json:"disable_frontend_install,omitempty"`
 }
 
 type securityRule struct {
@@ -91,6 +95,11 @@ func (c SecurityConf) SecurityPolicySummary() (disabled, enabled []string) {
 		} else {
 			enabled = append(enabled, strings.TrimPrefix(r.key, "disable_"))
 		}
+	}
+	if c.DisableFrontendInstall {
+		disabled = append(disabled, "disable_frontend_install")
+	} else {
+		enabled = append(enabled, "frontend_install")
 	}
 	sort.Strings(disabled)
 	return disabled, enabled

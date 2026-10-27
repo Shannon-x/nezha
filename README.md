@@ -122,6 +122,7 @@ security:
   disable_server_transfer: true   # 服务器迁移
   disable_agent_upgrade: false    # 远程强制升级 agent
   disable_nat: true               # 内网穿透
+  disable_frontend_install: true  # 在线安装第三方前端（开启后只用内置前端，已装的第三方前端自动退回内置）
 ```
 
 环境变量写法去掉键名中的下划线，例如 `NZ_SECURITY_DISABLECOMMANDEXECUTE=true`。

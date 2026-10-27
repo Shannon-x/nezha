@@ -86,6 +86,10 @@ func installFrontend(c *gin.Context) (*model.FrontendTemplate, error) {
 	if err := c.ShouldBindJSON(&form); err != nil {
 		return nil, err
 	}
+	if singleton.Conf.Security.DisableFrontendInstall {
+		// fork: 面板侧高危能力锁
+		return nil, errors.New("frontend installation is disabled by dashboard security policy (security.disable_frontend_install in config.yaml)")
+	}
 	if singleton.Conf.FrontendStore == nil {
 		return nil, errors.New("frontend storage is not initialized")
 	}

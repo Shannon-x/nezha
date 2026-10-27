@@ -32,6 +32,11 @@ func TestSecurityPolicyBlocksOnlyConfiguredTaskTypes(t *testing.T) {
 	s := &Server{}
 	require.ErrorAs(t, s.SendTask(&pb.Task{Type: TaskTypeTerminalGRPC}), &disabled)
 	require.True(t, errors.Is(s.SendTask(&pb.Task{Type: TaskTypeHTTPGet}), ErrTaskStreamOffline))
+
+	// Every delivery entry point is gated, including the queued fan-out used by cron.
+	require.ErrorAs(t, s.SendTaskGuarded(&pb.Task{Type: TaskTypeTerminalGRPC}, nil), &disabled)
+	require.ErrorAs(t, s.QueueTaskGuarded(&pb.Task{Type: TaskTypeTerminalGRPC}, nil), &disabled)
+	require.ErrorAs(t, s.QueueTask(&pb.Task{Type: TaskTypeTerminalGRPC}), &disabled)
 }
 
 // Every task type that is not a passive monitor or keepalive grants control over the

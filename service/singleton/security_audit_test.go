@@ -63,3 +63,26 @@ func TestRunSecurityAuditFlagsRisks(t *testing.T) {
 	require.Contains(t, out, "已关闭：disable_terminal")
 	require.Contains(t, out, "用户 1 个 [admin(admin)]")
 }
+
+func TestFrontendLockFallsBackToBuiltin(t *testing.T) {
+	require.NoError(t, InitFrontendTemplates())
+	previousConf := Conf
+	t.Cleanup(func() { Conf = previousConf })
+	Conf = &ConfigClass{Config: &model.Config{}}
+	Conf.UserTemplate, Conf.AdminTemplate = "nazhua-dist", "frontends/evil/admin"
+
+	user, admin := Conf.FrontendSelection()
+	require.Equal(t, "frontends/evil/admin", admin, "unlocked selection is served as configured")
+
+	Conf.Security.DisableFrontendInstall = true
+	user, admin = Conf.FrontendSelection()
+	require.Equal(t, "nazhua-dist", user, "built-in user frontends stay selectable")
+	require.Equal(t, "admin-dist", admin, "third-party admin frontend falls back to the built-in one")
+
+	Conf.UserTemplate = "frontends/evil/user"
+	user, _ = Conf.FrontendSelection()
+	require.Equal(t, "user-dist", user)
+	for _, tpl := range Conf.AvailableFrontendTemplates() {
+		require.NotContains(t, tpl.Path, "frontends/", "only built-in templates are offered while locked")
+	}
+}
