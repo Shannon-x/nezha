@@ -108,10 +108,16 @@ func (c *ConfigClass) SettingsSnapshot() model.Setting {
 	defer c.natDomainPolicyMu.RUnlock()
 	c.onlineHistoryRetentionMu.RLock()
 	defer c.onlineHistoryRetentionMu.RUnlock()
+	dashboard := c.ConfigDashboard
+	if c.Security.DisableFrontendInstall {
+		// fork: 返回实际生效的前端，否则设置页会回传被锁定的第三方前端而无法保存
+		dashboard.UserTemplate = builtinFrontendOr(dashboard.UserTemplate, "user-dist", false)
+		dashboard.AdminTemplate = builtinFrontendOr(dashboard.AdminTemplate, "admin-dist", true)
+	}
 	return model.Setting{
 		NATMemberDomains:               append([]string(nil), c.NATMemberDomains...),
 		ConfigForGuests:                c.ConfigForGuests,
-		ConfigDashboard:                c.ConfigDashboard,
+		ConfigDashboard:                dashboard,
 		IgnoredIPNotificationServerIDs: c.IgnoredIPNotificationServerIDs,
 		Oauth2Providers:                c.Oauth2Providers,
 	}

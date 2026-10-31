@@ -82,6 +82,10 @@ func TestFrontendLockFallsBackToBuiltin(t *testing.T) {
 	Conf.UserTemplate = "frontends/evil/user"
 	user, _ = Conf.FrontendSelection()
 	require.Equal(t, "user-dist", user)
+	// The settings page must round-trip the effective selection, or saving fails validation.
+	snapshot := Conf.SettingsSnapshot()
+	require.Equal(t, "user-dist", snapshot.UserTemplate)
+	require.Equal(t, "admin-dist", snapshot.AdminTemplate)
 	for _, tpl := range Conf.AvailableFrontendTemplates() {
 		require.NotContains(t, tpl.Path, "frontends/", "only built-in templates are offered while locked")
 	}
