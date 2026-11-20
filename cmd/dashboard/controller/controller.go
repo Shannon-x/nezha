@@ -69,9 +69,8 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	// mcpOriginGuard 防止 DNS rebinding / 浏览器跨站调用。
 	registerMCPOAuthRoutes(r)
 	r.GET(mcpOAuthFrontendPath, func(c *gin.Context) {
-		// OAuth consent must not be embedded by another site for clickjacking.
-		c.Header("X-Frame-Options", "DENY")
-		c.Header("Content-Security-Policy", "frame-ancestors 'none'")
+		// The authorization request in the query must not leak through Referer.
+		// Framing is forbidden by fallbackToFrontend for the whole admin frontend.
 		c.Header("Referrer-Policy", "no-referrer")
 		c.Next()
 	}, fallbackToFrontend(frontendDist))
@@ -85,7 +84,9 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	r.POST("/mcp/upload/:token", mcpOriginGuard(), transferUploadHandler)
 	registerAgentcompatRoutes(r)
 
-	api := r.Group("api/v1")
+	// 所有 /api/v1 请求体统一限长：ShouldBindJSON 会完整读取请求体
+	// （GHSA-8fgr-wx8p-v6q7）。
+	api := r.Group("api/v1", restRequestBodyLimitMiddleware(restAPIRequestMaxBodyBytes))
 	api.POST("/login", authMiddleware.LoginHandler)
 
 	fallbackAuthMw := fallbackAuthMiddleware(authMiddleware)
@@ -94,6 +95,8 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	fallbackAuth.GET("/oauth2/:provider", commonHandler(oauth2redirect))
 	fallbackAuth.GET("/setting", commonHandler(listConfig))
 	fallbackAuth.GET("/oauth2/callback", commonHandler(oauth2callback(authMiddleware)))
+	// With several providers each one is given its own callback path.
+	fallbackAuth.GET("/oauth2/callback/:provider", commonHandler(oauth2callback(authMiddleware)))
 
 	jwtMw := authMiddleware.MiddlewareFunc()
 	patMw := apiTokenAuthMiddleware()
@@ -515,6 +518,11 @@ func fallbackToFrontend(frontendDist fs.FS) func(*gin.Context) {
 		userTemplate, adminTemplate := singleton.Conf.FrontendSelection()
 		// Only /dashboard/ belongs to the admin frontend; /dashboard.. must not be trimmed into ../.
 		if strings.HasPrefix(c.Request.URL.Path, "/dashboard/") {
+			// The admin frontend routes on the client, so index.html served for any
+			// method or path spelling under /dashboard/ can render the OAuth consent
+			// view. It must not be embedded by another site for clickjacking.
+			c.Header("X-Frame-Options", "DENY")
+			c.Header("Content-Security-Policy", "frame-ancestors 'none'")
 			stripPath := strings.TrimPrefix(c.Request.URL.Path, "/dashboard/")
 			if checkLocalFileOrFs(c, frontendDist, adminTemplate, stripPath, http.StatusOK) {
 				return

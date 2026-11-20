@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -68,6 +69,26 @@ const (
 // always small. The cap is intentionally generous (8 MiB) to allow
 // per-request batched arguments while making OOM-via-decode impossible.
 const mcpJSONRPCMaxBodyBytes = 8 * 1024 * 1024
+
+// Bounds on request-controlled text that is repeated in a reply. The body cap
+// above limits what is read, not what is written back: a reply is rendered in
+// memory and the JSON encoder writes '<', '>' and '&' as six-byte escapes, so
+// an 8 MiB id, method or tool name would cost a ~50 MB answer per call, rate
+// limit refusals included. The id is raw JSON and cannot be shortened, so a
+// longer one is refused; real clients send a number or a short string. Other
+// echoed text (method, tool name, argument decode errors) is truncated.
+const (
+	mcpJSONRPCMaxIDBytes = 256
+	mcpMaxEchoBytes      = 256
+)
+
+// mcpMaxInlineArgBytes bounds the bulk arguments a tool forwards to an agent
+// inline (fs.write content; server.exec cmd, args, cwd, env and stdin). The
+// envelope cap above is not enough for them: rpc.CallAgent re-encodes the
+// arguments into Task.Data (json.Marshal writes <, > and & as six bytes each)
+// and the gRPC layer copies the Task again, so every byte accepted here is
+// held many times over. Larger payloads go through fs.upload_url, which streams.
+const mcpMaxInlineArgBytes = 1024 * 1024
 
 // --- MCP types ---
 
@@ -182,15 +203,19 @@ func mcpEndpoint(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, mcpJSONRPCMaxBodyBytes)
 	}
 
+	var req jsonRPCRequest
+	err := c.ShouldBindJSON(&req)
+
 	// Consume the per-token budget before validating the request so malformed
 	// envelopes and malformed tools/call params cannot flood the dashboard
-	// without counting against the limiter. The outcome is applied after the
-	// method is known so tools/call still surfaces the rate limit as a tool
-	// error rather than a transport-level error.
+	// without counting against the limiter, but only once the body is in: the
+	// client decides when the body arrives, so a verdict taken at the request
+	// head could be collected over many windows and spent in one instant. The
+	// outcome is applied after the method is known so tools/call still surfaces
+	// the rate limit as a tool error rather than a transport-level error.
 	rateLimited := !mcpRateLimiterShared.Allow(tok.ID)
 
-	var req jsonRPCRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err != nil {
 		if errors.Is(err, errors.New("http: request body too large")) || strings.Contains(err.Error(), "http: request body too large") {
 			writeJSONRPCErrorWithStatus(c, nil, rpcErrInvalidRequest, "request body exceeds MCP envelope size limit", http.StatusRequestEntityTooLarge)
 			return
@@ -204,7 +229,13 @@ func mcpEndpoint(c *gin.Context) {
 		writeJSONRPCError(c, nil, rpcErrParse, "invalid json-rpc envelope: "+err.Error())
 		return
 	}
-	if req.JSONRPC != "2.0" || req.Method == "" {
+	// Every reply below repeats req.ID, so an oversized one is dropped here,
+	// before the rate-limit branches, and the envelope is refused without it.
+	idTooLong := len(req.ID) > mcpJSONRPCMaxIDBytes
+	if idTooLong {
+		req.ID = nil
+	}
+	if req.JSONRPC != "2.0" || req.Method == "" || idTooLong {
 		if rateLimited {
 			writeJSONRPCErrorWithStatus(c, req.ID, rpcErrForbidden, "rate limit exceeded for this token", http.StatusTooManyRequests)
 			return
@@ -248,7 +279,7 @@ func mcpEndpoint(c *gin.Context) {
 	case "tools/call":
 		handleToolsCall(c, &req, tok)
 	default:
-		writeJSONRPCError(c, req.ID, rpcErrMethodNotFound, "method not supported: "+req.Method)
+		writeJSONRPCError(c, req.ID, rpcErrMethodNotFound, "method not supported: "+truncateString(req.Method, mcpMaxEchoBytes))
 	}
 }
 
@@ -302,7 +333,7 @@ func handleToolsCall(c *gin.Context, req *jsonRPCRequest, tok *model.APIToken) {
 	tool, ok := mcpTools[p.Name]
 	mcpToolsMu.RUnlock()
 	if !ok {
-		writeJSONRPCError(c, req.ID, rpcErrMethodNotFound, "unknown tool: "+p.Name)
+		writeJSONRPCError(c, req.ID, rpcErrMethodNotFound, "unknown tool: "+truncateString(p.Name, mcpMaxEchoBytes))
 		return
 	}
 
@@ -321,20 +352,18 @@ func handleToolsCall(c *gin.Context, req *jsonRPCRequest, tok *model.APIToken) {
 	}
 
 	finish := func(outcome, errCode, errMsg string, result any) {
+		var textPayload string
 		if outcome == model.MCPOutcomeOK {
-			textPayload, err := marshalMCPToolResult(result)
-			if err != nil {
+			var err error
+			if textPayload, err = marshalMCPToolResult(result); err != nil {
 				outcome = model.MCPOutcomeAgentError
 				errCode = model.MCPOutcomeAgentError
 				errMsg = "failed to encode tool result: " + err.Error()
 				result = nil
-			} else {
-				writeJSONRPCResult(c, req.ID, mcpToolCallResult{
-					Content:           []mcpContent{{Type: "text", Text: textPayload}},
-					StructuredContent: result,
-				})
 			}
 		}
+		// The call is audited before it is answered: how long the response
+		// takes, and whether it is ever read to the end, is up to the client.
 		audit.Outcome = outcome
 		audit.ErrorCode = errCode
 		audit.ErrorMsg = truncateString(errMsg, 512)
@@ -343,6 +372,10 @@ func handleToolsCall(c *gin.Context, req *jsonRPCRequest, tok *model.APIToken) {
 		mcpAuditWrite(audit, p.Arguments)
 
 		if outcome == model.MCPOutcomeOK {
+			writeJSONRPCResult(c, req.ID, mcpToolCallResult{
+				Content:           []mcpContent{{Type: "text", Text: textPayload}},
+				StructuredContent: result,
+			})
 			return
 		}
 		// Semantic tool failures may retain a typed structured result (notably
@@ -372,6 +405,15 @@ func handleToolsCall(c *gin.Context, req *jsonRPCRequest, tok *model.APIToken) {
 		c.Request = c.Request.WithContext(callCtx)
 	}
 
+	// The middlewares accepted the credential when the request head arrived,
+	// but the client decides when the body follows. Check it again now that the
+	// cancel hook is registered, so nothing invalidated in between is dispatched.
+	if err := revalidateMCPCallCredential(c, tok); err != nil {
+		code, msg := classifyToolError(err)
+		finish(code, code, msg, nil)
+		return
+	}
+
 	result, err := tool.Handler(c, p.Arguments)
 	if err != nil {
 		code, msg := classifyToolError(err)
@@ -384,6 +426,35 @@ func handleToolsCall(c *gin.Context, req *jsonRPCRequest, tok *model.APIToken) {
 		return
 	}
 	finish(model.MCPOutcomeOK, "", "", result)
+}
+
+var errMCPCredentialInvalid = newMCPError(model.MCPOutcomePermDenied, "credential revoked or expired")
+
+// revalidateMCPCallCredential repeats at dispatch what the auth middlewares
+// checked on the request head. The revocation registry only learns about
+// explicit revocations and forgets them after revokeTombstoneTTL; OAuth
+// credentials mostly die lazily (password change, refresh rotation, expiry,
+// audience change), so the stored rows are the only authority.
+func revalidateMCPCallCredential(c *gin.Context, tok *model.APIToken) error {
+	if singleton.Conf == nil || !singleton.Conf.MCPEnabled() {
+		return rpc.ErrMCPDisabled
+	}
+	if value, viaOAuth := c.Get(mcpOAuthGrantContextKey); viaOAuth {
+		grant, _ := value.(*model.MCPOAuthGrant)
+		if grant == nil || revalidateMCPOAuthCredential(grant.ID, grant.AccessHash, tok.ID, tok.UserID) != nil {
+			return errMCPCredentialInvalid
+		}
+		return nil
+	}
+	var current model.APIToken
+	if singleton.DB.First(&current, tok.ID).Error != nil || current.UserID != tok.UserID || current.IsExpired(time.Now()) {
+		return errMCPCredentialInvalid
+	}
+	var owner model.User
+	if singleton.DB.Select("id").First(&owner, tok.UserID).Error != nil {
+		return errMCPCredentialInvalid
+	}
+	return nil
 }
 
 // classifyToolError 把任何 handler 返回的 error 归类成审计 outcome + 安全错误消息。
@@ -403,10 +474,18 @@ func classifyToolError(err error) (code, msg string) {
 		// “管理员关了 MCP”误报成 agent 故障；错误文本透传原始原因。
 		return model.MCPOutcomeMCPDisabled, err.Error()
 	}
+	if errors.Is(err, rpc.ErrMCPTaskTooLarge) {
+		return model.MCPOutcomeInvalidArgs, err.Error()
+	}
 	return model.MCPOutcomeAgentError, err.Error()
 }
 
 // extractServerID 从 raw arguments JSON 里提取 server_id（best-effort，只用于审计字段）。
+//
+// server_id 完全由调用方填写，不使用它的 tool（server.list / meta.whoami）和被拒绝的
+// 调用也会走到这里。database/sql 无法绑定高位为 1 的 uint64，原样写入会让整条审计
+// INSERT 失败，调用方就能按次决定自己是否留痕；这种 ID 不可能对应真实 server，
+// 记 0 即可，args_hash 仍能关联到这次调用。
 func extractServerID(raw json.RawMessage) uint64 {
 	if len(raw) == 0 {
 		return 0
@@ -415,6 +494,9 @@ func extractServerID(raw json.RawMessage) uint64 {
 		ServerID uint64 `json:"server_id"`
 	}
 	_ = json.Unmarshal(raw, &probe)
+	if probe.ServerID > math.MaxInt64 {
+		return 0
+	}
 	return probe.ServerID
 }
 
@@ -493,7 +575,8 @@ func decodeToolArgs(raw json.RawMessage, out any) error {
 		return nil
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("invalid arguments: %w", err)
+		// encoding/json quotes an out-of-range number literal in full.
+		return fmt.Errorf("invalid arguments: %s", truncateString(err.Error(), mcpMaxEchoBytes))
 	}
 	return nil
 }

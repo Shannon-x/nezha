@@ -1,9 +1,12 @@
 package controller
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,6 +88,13 @@ func oauth2redirect(c *gin.Context) (*model.Oauth2LoginResponse, error) {
 		return nil, singleton.Localizer.ErrorT("provider not found")
 	}
 	redirectURL := getRedirectURL(c)
+	if len(singleton.Conf.Oauth2) > 1 {
+		// OAuth mix-up defence (RFC 9700 section 4.4.2): with several providers
+		// each one gets its own redirect URI, so the path a code arrives on
+		// tells which provider issued it. A single provider keeps the shared
+		// path, so existing single-provider registrations stay valid.
+		redirectURL += "/" + url.PathEscape(provider)
+	}
 	o2conf := o2confRaw.Setup(redirectURL)
 
 	randomString, err := utils.GenerateRandomString(32)
@@ -162,6 +172,7 @@ func unbindOauth2(c *gin.Context) (any, error) {
 // @Param code query string true "code"
 // @Success 200 {object} model.CommonResponse[any]
 // @Router /api/v1/oauth2/callback [get]
+// @Router /api/v1/oauth2/callback/{provider} [get]
 func oauth2callback(jwtConfig *jwt.GinJWTMiddleware) func(c *gin.Context) (any, error) {
 	return func(c *gin.Context) (any, error) {
 		callbackData := &model.Oauth2Callback{
@@ -172,6 +183,12 @@ func oauth2callback(jwtConfig *jwt.GinJWTMiddleware) func(c *gin.Context) (any, 
 		state, err := verifyState(c, callbackData.State)
 		if err != nil {
 			return nil, err
+		}
+		// The state says which provider was asked, the path which one answered.
+		// A code another provider issued must not reach this one's token_url,
+		// so the shared path is not accepted either once there are several.
+		if len(singleton.Conf.Oauth2) > 1 && c.Param("provider") != state.Provider {
+			return nil, singleton.Localizer.ErrorT("invalid state key")
 		}
 
 		o2confRaw, has := singleton.Conf.Oauth2[state.Provider]
@@ -192,6 +209,7 @@ func oauth2callback(jwtConfig *jwt.GinJWTMiddleware) func(c *gin.Context) (any, 
 		}
 
 		var bind model.Oauth2Bind
+		var bindUser model.User
 		state.Provider = strings.ToLower(state.Provider)
 		switch state.Action {
 		case model.RTypeBind:
@@ -201,32 +219,50 @@ func oauth2callback(jwtConfig *jwt.GinJWTMiddleware) func(c *gin.Context) (any, 
 			}
 			user := u.(*model.User)
 
-			result := singleton.DB.Where("provider = ? AND open_id = ?", state.Provider, openId).Limit(1).Find(&bind)
-			if result.Error != nil && result.Error != gorm.ErrRecordNotFound {
-				return nil, newGormError("%v", result.Error)
-			}
-			bind.UserID = user.ID
-			bind.Provider = state.Provider
-			bind.OpenID = openId
+			// The session was authenticated before exchangeOpenId waited for the
+			// provider; a credential change during that wait has revoked it. Check
+			// it again in the transaction that stores the binding, so that no such
+			// change can land between the check and the write either.
+			err = singleton.DB.Transaction(func(tx *gorm.DB) error {
+				if !jwtSessionStillLive(tx, state.SessionID, user.ID) {
+					return singleton.Localizer.ErrorT("unauthorized")
+				}
 
-			if result.Error == gorm.ErrRecordNotFound {
-				result = singleton.DB.Create(&bind)
-			} else {
-				result = singleton.DB.Save(&bind)
+				result := tx.Where("provider = ? AND open_id = ?", state.Provider, openId).Limit(1).Find(&bind)
+				if result.Error != nil && result.Error != gorm.ErrRecordNotFound {
+					return newGormError("%v", result.Error)
+				}
+				bind.UserID = user.ID
+				bind.Provider = state.Provider
+				bind.OpenID = openId
+
+				if result.Error == gorm.ErrRecordNotFound {
+					result = tx.Create(&bind)
+				} else {
+					result = tx.Save(&bind)
+				}
+				if result.Error != nil {
+					return newGormError("%v", result.Error)
+				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
 			}
-			if result.Error != nil {
-				return nil, newGormError("%v", result.Error)
-			}
+			// The session issued below continues the one that was just checked.
+			// Issue it for the token_version that one was authenticated against,
+			// not for a reloaded one: a credential change after the check then
+			// leaves it as stale as the session it came from.
+			bindUser = *user
 		default:
 			if err := singleton.DB.Where("provider = ? AND open_id = ?", state.Provider, openId).First(&bind).Error; err != nil {
 				return nil, singleton.Localizer.ErrorT("oauth2 user not binded yet")
 			}
+			if err := singleton.DB.First(&bindUser, bind.UserID).Error; err != nil {
+				return nil, newGormError("%v", err)
+			}
 		}
 
-		var bindUser model.User
-		if err := singleton.DB.First(&bindUser, bind.UserID).Error; err != nil {
-			return nil, newGormError("%v", err)
-		}
 		claims, err := issueJWTSession(c, &bindUser, singleton.Conf.JWTTimeout)
 		if err != nil {
 			return nil, err
@@ -244,15 +280,32 @@ func oauth2callback(jwtConfig *jwt.GinJWTMiddleware) func(c *gin.Context) (any, 
 	}
 }
 
+// oauth2ProviderHTTPClient calls only the token_url and user_info_url the
+// operator configured. Without it golang.org/x/oauth2 falls back to
+// http.DefaultClient, which follows redirects: the provider's answer would
+// then choose the next address the Dashboard calls (loopback, private ranges,
+// metadata services), the bearer token or client secret would be sent there,
+// and the answer would be taken as the token or userinfo document. The
+// addresses themselves are not filtered as in utils.NewRestrictedHTTPClient,
+// because a provider may legitimately live on a private network. The timeout
+// is the one pkg/utils sets on http.DefaultClient.
+var oauth2ProviderHTTPClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+	Timeout: time.Minute * 10,
+}
+
 func exchangeOpenId(c *gin.Context, o2confRaw *model.Oauth2Config,
 	callbackData *model.Oauth2Callback, redirectURL string) (string, error) {
 	o2conf := o2confRaw.Setup(redirectURL)
+	ctx := context.WithValue(c, oauth2.HTTPClient, oauth2ProviderHTTPClient)
 
-	otk, err := o2conf.Exchange(c, callbackData.Code)
+	otk, err := o2conf.Exchange(ctx, callbackData.Code)
 	if err != nil {
 		return "", err
 	}
-	oauth2client := o2conf.Client(c, otk)
+	oauth2client := o2conf.Client(ctx, otk)
 	resp, err := oauth2client.Get(o2confRaw.UserInfoURL)
 	if err != nil {
 		return "", err
@@ -268,7 +321,10 @@ func exchangeOpenId(c *gin.Context, o2confRaw *model.Oauth2Config,
 		return "", err
 	}
 
-	if len(body) > maxUserInfoSize || !gjson.ValidBytes(body) {
+	// gjson.ValidBytes recurses once per nesting level with no depth limit, so a body of
+	// "[" within the size cap grows this goroutine's stack to over 100 MiB. json.Valid
+	// does not recurse and rejects documents nested deeper than 10000 levels.
+	if len(body) > maxUserInfoSize || !json.Valid(body) {
 		return "", fmt.Errorf("invalid or oversized userinfo response")
 	}
 	id := gjson.GetBytes(body, o2confRaw.UserIDPath)

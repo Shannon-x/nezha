@@ -1,16 +1,19 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/goccy/go-json"
 	"github.com/nezhahq/nezha/pkg/utils"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -45,9 +48,24 @@ type Notification struct {
 
 func (ns *NotificationServerBundle) reqURL(message string) string {
 	n := ns.Notification
-	return ns.replaceParamsInString(n.URL, message, func(msg string) string {
-		return url.QueryEscape(msg)
-	})
+	base, query, hasQuery := strings.Cut(n.URL, "?")
+	reqURL := ns.replaceParamsInString(base, message, url.QueryEscape)
+	if !hasQuery {
+		return reqURL
+	}
+	// Like a form field, a query parameter may hold a JSON document.
+	params := strings.Split(query, "&")
+	for i, param := range params {
+		escape := url.QueryEscape
+		_, value, _ := strings.Cut(param, "=")
+		if value, err := url.QueryUnescape(value); err == nil {
+			if jsonEscape := jsonTemplateEscape(value); jsonEscape != nil {
+				escape = func(msg string) string { return url.QueryEscape(jsonEscape(msg)) }
+			}
+		}
+		params[i] = ns.replaceParamsInString(param, message, escape)
+	}
+	return reqURL + "?" + strings.Join(params, "&")
 }
 
 func (n *Notification) reqMethod() (string, error) {
@@ -67,10 +85,7 @@ func (ns *NotificationServerBundle) reqBody(message string) (string, error) {
 	}
 	switch n.RequestType {
 	case NotificationRequestTypeJSON:
-		return ns.replaceParamsInString(n.RequestBody, message, func(msg string) string {
-			msgBytes, _ := json.Marshal(msg)
-			return string(msgBytes)[1 : len(msgBytes)-1]
-		}), nil
+		return ns.replaceParamsInString(n.RequestBody, message, jsonStringEscape), nil
 	case NotificationRequestTypeForm:
 		data, err := utils.GjsonIter(n.RequestBody)
 		if err != nil {
@@ -78,11 +93,44 @@ func (ns *NotificationServerBundle) reqBody(message string) (string, error) {
 		}
 		params := url.Values{}
 		for k, v := range data {
-			params.Add(k, ns.replaceParamsInString(v, message, nil))
+			params.Add(k, ns.replaceParamsInString(v, message, jsonTemplateEscape(v)))
 		}
 		return params.Encode(), nil
 	}
 	return "", errors.New("不支持的请求类型")
+}
+
+// jsonStringEscape escapes msg for use inside a JSON string literal.
+func jsonStringEscape(msg string) string {
+	msgBytes, _ := json.Marshal(msg)
+	return string(msgBytes)[1 : len(msgBytes)-1]
+}
+
+// templatePlaceholder matches the placeholders of replaceParamsInString:
+// #NEZHA#, #DATETIME#, #SERVER.NAME#, ...
+var templatePlaceholder = regexp.MustCompile(`#[A-Z0-9.]+#`)
+
+// jsonTemplateEscape returns the escaping that placeholder values need before
+// they are expanded in value, one form field or query parameter of a template.
+// Such a field may hold a JSON document, as in Slack's
+// payload={"text":"#NEZHA#"}: form encoding keeps a value inside the field but
+// not inside the string literal, so it needs jsonStringEscape like a JSON
+// body. For a plain text field the result is nil.
+func jsonTemplateEscape(value string) func(string) string {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "{") && !strings.HasPrefix(value, "[") {
+		return nil
+	}
+	// Without a string literal there is nothing to break out of, and
+	// "[#SERVER.NAME#]" is plain text.
+	if !strings.Contains(value, `"`) {
+		return nil
+	}
+	// A placeholder may also stand for a number: {"swap":#SERVER.SWAPUSED#}.
+	if !gjson.Valid(templatePlaceholder.ReplaceAllString(value, "0")) {
+		return nil
+	}
+	return jsonStringEscape
 }
 
 func (n *Notification) setContentType(req *http.Request) {
@@ -111,6 +159,12 @@ func (n *Notification) setRequestHeader(req *http.Request) error {
 }
 
 func (ns *NotificationServerBundle) Send(message string) error {
+	return ns.SendContext(context.Background(), message)
+}
+
+// SendContext is Send with a context that aborts the delivery, including a
+// request that is already waiting for the webhook, as soon as it is canceled.
+func (ns *NotificationServerBundle) SendContext(ctx context.Context, message string) error {
 	n := ns.Notification
 	verifyTLS := n.VerifyTLS != nil && *n.VerifyTLS
 
@@ -125,12 +179,12 @@ func (ns *NotificationServerBundle) Send(message string) error {
 	}
 
 	reqURL := ns.reqURL(message)
-	client, err := newNotificationHTTPClient(reqURL, verifyTLS)
+	client, err := newNotificationHTTPClient(ctx, reqURL, verifyTLS)
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest(reqMethod, reqURL, strings.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, reqMethod, reqURL, strings.NewReader(reqBody))
 	if err != nil {
 		return err
 	}
@@ -163,8 +217,8 @@ func notificationResponseError(resp *http.Response) error {
 	return fmt.Errorf("%d@%s", resp.StatusCode, resp.Status)
 }
 
-func newNotificationHTTPClient(rawURL string, verifyTLS bool) (*http.Client, error) {
-	return utils.NewRestrictedHTTPClient(rawURL, !verifyTLS)
+func newNotificationHTTPClient(ctx context.Context, rawURL string, verifyTLS bool) (*http.Client, error) {
+	return utils.NewRestrictedHTTPClientContext(ctx, rawURL, !verifyTLS)
 }
 
 // replaceParamInString 替换字符串中的占位符
@@ -190,9 +244,9 @@ func (ns *NotificationServerBundle) replaceParamsInString(str string, message st
 			replacements = append(replacements,
 				// Converted metrics
 				"#SERVER.CPU#", mod(ns.formatUsage(false, state.CPU)),
-				"#SERVER.MEM#", mod(ns.formatUsage(true, safeDiv(float64(state.MemUsed), float64(host.MemTotal)))),
-				"#SERVER.SWAP#", mod(ns.formatUsage(true, safeDiv(float64(state.SwapUsed), float64(host.SwapTotal)))),
-				"#SERVER.DISK#", mod(ns.formatUsage(true, safeDiv(float64(state.DiskUsed), float64(host.DiskTotal)))),
+				"#SERVER.MEM#", mod(ns.formatUsage(true, usageRatio(state.MemUsed, host.MemTotal))),
+				"#SERVER.SWAP#", mod(ns.formatUsage(true, usageRatio(state.SwapUsed, host.SwapTotal))),
+				"#SERVER.DISK#", mod(ns.formatUsage(true, usageRatio(state.DiskUsed, host.DiskTotal))),
 				"#SERVER.SPEEDIN#", mod(fmt.Sprintf("%s/s", ns.formatSize(state.NetInSpeed))),
 				"#SERVER.SPEEDOUT#", mod(fmt.Sprintf("%s/s", ns.formatSize(state.NetOutSpeed))),
 				"#SERVER.TRANSFERIN#", mod(ns.formatSize(state.NetInTransfer)),
@@ -245,6 +299,15 @@ func (ns *NotificationServerBundle) replaceParamsInString(str string, message st
 	return replacer.Replace(str)
 }
 
+// usageRatio returns used/total, or 0 when the agent reports no total (e.g. no
+// swap, or no host report yet), so templates never render NaN or Inf.
+func usageRatio(used, total uint64) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(used) / float64(total)
+}
+
 func (ns *NotificationServerBundle) formatUsage(toPercentage bool, usage float64) string {
 	if ns.Notification.FormatMetricUnits != nil && *ns.Notification.FormatMetricUnits {
 		if toPercentage {
@@ -261,11 +324,4 @@ func (ns *NotificationServerBundle) formatSize(size uint64) string {
 		return utils.Bytes(size)
 	}
 	return fmt.Sprintf("%d", size)
-}
-
-func safeDiv(a, b float64) float64 {
-	if b == 0 {
-		return 0
-	}
-	return a / b
 }

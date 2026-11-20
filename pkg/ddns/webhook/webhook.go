@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,8 @@ var requestTypes = map[uint8]string{
 	methodPUT:    "PUT",
 }
 
+var errInvalidURL = errors.New("invalid webhook URL")
+
 // Internal use
 type Provider struct {
 	ipAddr     string
@@ -63,11 +66,11 @@ func (provider *Provider) SetRecords(ctx context.Context, zone string,
 			// by a single DNS resolution. Do not swap the client for utils.HttpClient.
 			req, client, err := provider.prepareRequest(ctx)
 			if err != nil {
-				return nil, fmt.Errorf("failed to update a domain: %s. Cause by: %v", provider.domain, err)
+				return nil, fmt.Errorf("failed to update a domain: %s. Cause by: %v", provider.domain, withoutRequestURL(err))
 			}
 			resp, err := client.Do(req)
 			if err != nil {
-				return nil, fmt.Errorf("failed to update a domain: %s. Cause by: %v", provider.domain, err)
+				return nil, fmt.Errorf("failed to update a domain: %s. Cause by: %v", provider.domain, withoutRequestURL(err))
 			}
 			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
@@ -77,6 +80,23 @@ func (provider *Provider) SetRecords(ctx context.Context, zone string,
 	}
 
 	return recs, nil
+}
+
+// withoutRequestURL strips the request URL from net/url and net/http errors.
+// The webhook URL is a stored credential (tokens in path or query, with
+// #access_id# / #access_secret# already expanded) and the DDNS worker writes
+// the error returned by SetRecords to the dashboard log.
+func withoutRequestURL(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	if urlErr.Op == "parse" {
+		// The cause quotes pieces of the URL as well (a bad escape, or part
+		// of an unescaped password taken for a port).
+		return errInvalidURL
+	}
+	return fmt.Errorf("%s: %w", urlErr.Op, urlErr.Err)
 }
 
 func (provider *Provider) prepareRequest(ctx context.Context) (*http.Request, *http.Client, error) {
@@ -96,8 +116,9 @@ func (provider *Provider) prepareRequest(ctx context.Context) (*http.Request, *h
 		return nil, nil, err
 	}
 
-	headers, err := utils.GjsonIter(
-		provider.formatWebhookString(provider.DDNSProfile.WebhookHeaders))
+	// Parse the template before expanding the placeholders, so that a value
+	// cannot add or replace headers.
+	headers, err := utils.GjsonIter(strings.TrimSpace(provider.DDNSProfile.WebhookHeaders))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -110,7 +131,7 @@ func (provider *Provider) prepareRequest(ctx context.Context) (*http.Request, *h
 	provider.setContentType(req)
 
 	for k, v := range headers {
-		req.Header.Set(k, v)
+		req.Header.Set(provider.formatWebhookString(k, nil), provider.formatWebhookString(v, nil))
 	}
 
 	return req, client, nil
@@ -139,7 +160,7 @@ func (provider *Provider) reqUrl() (*url.URL, error) {
 	q := u.Query()
 	for p, vals := range q {
 		for n, v := range vals {
-			vals[n] = provider.formatWebhookString(v)
+			vals[n] = provider.formatWebhookString(v, nil)
 		}
 		q[p] = vals
 	}
@@ -156,7 +177,10 @@ func (provider *Provider) reqBody() (string, error) {
 
 	switch provider.DDNSProfile.WebhookRequestType {
 	case requestTypeJSON:
-		return provider.formatWebhookString(provider.DDNSProfile.WebhookRequestBody), nil
+		return provider.formatWebhookString(provider.DDNSProfile.WebhookRequestBody, func(v string) string {
+			vBytes, _ := json.Marshal(v)
+			return string(vBytes)[1 : len(vBytes)-1]
+		}), nil
 	case requestTypeForm:
 		data, err := utils.GjsonIter(provider.DDNSProfile.WebhookRequestBody)
 		if err != nil {
@@ -164,7 +188,7 @@ func (provider *Provider) reqBody() (string, error) {
 		}
 		params := url.Values{}
 		for k, v := range data {
-			params.Add(k, provider.formatWebhookString(v))
+			params.Add(k, provider.formatWebhookString(v, nil))
 		}
 		return params.Encode(), nil
 	default:
@@ -172,14 +196,22 @@ func (provider *Provider) reqBody() (string, error) {
 	}
 }
 
-func (provider *Provider) formatWebhookString(s string) string {
+// formatWebhookString expands the placeholders in s. The values are not
+// written by the author of the template (#domain# may be a server's DDNS
+// domain override), so mod must encode them for the syntax s is written in;
+// it may be nil only if the caller encodes the result as a whole.
+func (provider *Provider) formatWebhookString(s string, mod func(string) string) string {
+	if mod == nil {
+		mod = func(v string) string { return v }
+	}
+
 	r := strings.NewReplacer(
-		"#ip#", provider.ipAddr,
-		"#domain#", provider.domain,
-		"#type#", provider.ipType,
-		"#record#", provider.recordType,
-		"#access_id#", provider.DDNSProfile.AccessID,
-		"#access_secret#", provider.DDNSProfile.AccessSecret,
+		"#ip#", mod(provider.ipAddr),
+		"#domain#", mod(provider.domain),
+		"#type#", mod(provider.ipType),
+		"#record#", mod(provider.recordType),
+		"#access_id#", mod(provider.DDNSProfile.AccessID),
+		"#access_secret#", mod(provider.DDNSProfile.AccessSecret),
 		"\r", "",
 	)
 

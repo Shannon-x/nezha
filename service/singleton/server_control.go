@@ -28,6 +28,35 @@ func ServerControlTransitioning(serverID uint64) bool {
 	return transfer.initiating[serverID] || transfer.pending[serverID] != nil || transfer.terminalSecretRecovery[serverID] != nil || transfer.revertDeliveries[serverID] != nil
 }
 
+// ServerOwnershipSettled reports whether userID owns the server with no
+// transfer still waiting for the agent to rotate. Register publishes the
+// destination as owner first, while Cancel/Fail/Timeout still hand the server
+// back, so until then an owner match must not let them edit or delete the
+// record: a delete also drops the pending entry that control admission and
+// agent auth are keyed on, and frees the UUID. Narrower than
+// ServerControlTransitioning on purpose: after a rollback the record is the
+// previous owner's again, even before the agent acknowledges it. Owner and
+// pending state are read under the lock they are published under.
+func ServerOwnershipSettled(serverID, userID uint64) bool {
+	lock := &serverControlLocks[serverID%uint64(len(serverControlLocks))]
+	lock.RLock()
+	defer lock.RUnlock()
+	server, ok := ServerShared.Get(serverID)
+	if !ok || server == nil {
+		return true // Unknown IDs have no ownership to settle.
+	}
+	if server.GetUserID() != userID {
+		return false
+	}
+	transfer := ServerTransferShared
+	if transfer == nil {
+		return true
+	}
+	transfer.mu.RLock()
+	defer transfer.mu.RUnlock()
+	return !transfer.initiating[serverID] && transfer.pending[serverID] == nil
+}
+
 // BeginServerControl returns a lease held until task dispatch / stream
 // registration finishes. Rollback remains blocked until the agent proves it
 // rotated credentials, rather than merely until the transfer row is terminal.
@@ -83,6 +112,18 @@ func ServerTaskAdmission(serverID, userID uint64) func() (func(), error) {
 		release, _, err := BeginServerControl(serverID, userID, userIsAdmin(userID))
 		return release, err
 	}
+}
+
+// serverTaskResultAdmitted is the inbound dual of ServerTaskAdmission: a task
+// result counts for userID's monitor or cron only while that task could still
+// be dispatched to the reporter. During a transfer Server.UserID already names
+// the destination user while the Agent stream may still authenticate with the
+// previous owner's secret, so ownership alone does not prove who is reporting.
+func serverTaskResultAdmitted(reporter *model.Server, userID uint64) bool {
+	if userIsAdmin(userID) {
+		return true
+	}
+	return reporter.GetUserID() == userID && !ServerControlTransitioning(reporter.ID)
 }
 
 // ServerControlEpoch invalidates derived URLs permanently on each transfer.

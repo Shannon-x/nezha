@@ -38,17 +38,26 @@ var blockedHTTPClientCIDRs = mustParseHTTPClientCIDRs([]string{
 	"240.0.0.0/4",
 	"::/128",
 	"::1/128",
+	"::/96",
 	"::ffff:0:0/96",
+	"::ffff:0:0:0/96",
 	"64:ff9b::/96",
 	"64:ff9b:1::/48",
 	"100::/64",
 	"2001::/23",
 	"2001:db8::/32",
 	"2002::/16",
+	"3fff::/20",
 	"fc00::/7",
 	"fe80::/10",
+	"fec0::/10",
 	"ff00::/8",
 })
+
+// IPv6 global unicast space is only assigned from 2000::/3. Everything outside
+// it is special-purpose, deprecated or unassigned, yet netip's IsGlobalUnicast
+// still reports it as global, so the deny list alone cannot be exhaustive.
+var allowedHTTPClientIPv6CIDR = netip.MustParsePrefix("2000::/3")
 
 func init() {
 	HttpClientSkipTlsVerify = httpClient(_httpClient{
@@ -88,7 +97,13 @@ func httpClient(conf _httpClient) *http.Client {
 }
 
 func NewRestrictedHTTPClient(rawURL string, skipVerifyTLS bool) (*http.Client, error) {
-	parsedURL, ip, err := ResolveAllowedHTTPURL(rawURL)
+	return NewRestrictedHTTPClientContext(context.Background(), rawURL, skipVerifyTLS)
+}
+
+// NewRestrictedHTTPClientContext is NewRestrictedHTTPClient with a context
+// that bounds the DNS lookup made while vetting the target.
+func NewRestrictedHTTPClientContext(ctx context.Context, rawURL string, skipVerifyTLS bool) (*http.Client, error) {
+	parsedURL, ip, err := resolveAllowedHTTPURL(ctx, rawURL)
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +132,12 @@ func buildRestrictedHTTPClient(parsedURL *url.URL, ip net.IP, skipVerifyTLS bool
 				return dialer.DialContext(ctx, network, targetAddress)
 			},
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: skipVerifyTLS, ServerName: parsedURL.Hostname()},
+			// Client.Timeout does not cover the handshake: net/http lets a dial and
+			// handshake run on after the request that started them was given up.
+			TLSHandshakeTimeout: time.Second * 10,
+			// Each client serves a single request, so a kept-alive connection
+			// would never be reused, only held open for as long as the peer likes.
+			DisableKeepAlives: true,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -126,6 +147,10 @@ func buildRestrictedHTTPClient(parsedURL *url.URL, ip net.IP, skipVerifyTLS bool
 }
 
 func ResolveAllowedHTTPURL(rawURL string) (*url.URL, net.IP, error) {
+	return resolveAllowedHTTPURL(context.Background(), rawURL)
+}
+
+func resolveAllowedHTTPURL(ctx context.Context, rawURL string) (*url.URL, net.IP, error) {
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, nil, err
@@ -145,7 +170,7 @@ func ResolveAllowedHTTPURL(rawURL string) (*url.URL, net.IP, error) {
 		return parsedURL, ip, nil
 	}
 
-	ips, err := net.LookupIP(host)
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -170,6 +195,9 @@ func HTTPURLTargetIPAllowed(ip net.IP) bool {
 		if cidr.Contains(parsedIP) {
 			return false
 		}
+	}
+	if parsedIP.Is6() && !allowedHTTPClientIPv6CIDR.Contains(parsedIP) {
+		return false
 	}
 	return parsedIP.IsGlobalUnicast()
 }

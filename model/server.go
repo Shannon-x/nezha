@@ -79,6 +79,10 @@ type taskStreamHolder struct {
 }
 
 type serverRuntimeHolder struct {
+	// leaseMu serializes a state stream's updates, disconnect and replacement
+	// together with their side effects, which may wait for the database. It is
+	// taken before mu, which is never held across a side effect.
+	leaseMu        sync.Mutex
 	mu             sync.Mutex
 	canonical      *Server
 	stream         pb.NezhaService_ReportSystemStateServer
@@ -190,9 +194,11 @@ func (lease StateStreamLease) updateState(receiver *Server, state *HostState, la
 	if lease.holder == nil {
 		return false
 	}
+	lease.holder.leaseMu.Lock()
+	defer lease.holder.leaseMu.Unlock()
 	lease.holder.mu.Lock()
-	defer lease.holder.mu.Unlock()
 	if lease.holder.generation != lease.generation || lease.holder.stream == nil || lease.holder.canonical == nil || (receiver != nil && lease.holder.canonical != receiver) {
+		lease.holder.mu.Unlock()
 		return false
 	}
 	canonical := lease.holder.canonical
@@ -206,12 +212,15 @@ func (lease StateStreamLease) updateState(receiver *Server, state *HostState, la
 	}
 	canonical.PrevTransferInSnapshot = lease.holder.prevIn
 	canonical.PrevTransferOutSnapshot = lease.holder.prevOut
+	// Published together with the state it identifies: a snapshot taken during
+	// the side effect must not pair this report with its predecessor's sequence.
+	lease.holder.reportSequence = nextServerReportSequence.Add(1)
+	lease.holder.mu.Unlock()
 	if sideEffect != nil {
 		if err := sideEffect(); err != nil {
 			return false
 		}
 	}
-	lease.holder.reportSequence = nextServerReportSequence.Add(1)
 	return true
 }
 
@@ -229,14 +238,17 @@ func (lease StateStreamLease) clear(receiver *Server, sideEffect func()) bool {
 	if lease.holder == nil {
 		return false
 	}
+	lease.holder.leaseMu.Lock()
+	defer lease.holder.leaseMu.Unlock()
 	lease.holder.mu.Lock()
-	defer lease.holder.mu.Unlock()
 	if lease.holder.generation != lease.generation || lease.holder.stream == nil || lease.holder.canonical == nil || (receiver != nil && lease.holder.canonical != receiver) {
+		lease.holder.mu.Unlock()
 		return false
 	}
 	lease.holder.stream = nil
 	lease.holder.lastActive = time.Time{}
 	lease.holder.canonical.LastActive = time.Time{}
+	lease.holder.mu.Unlock()
 	if sideEffect != nil {
 		sideEffect()
 	}
@@ -330,7 +342,6 @@ func (s *Server) AttachStateStream(stream pb.NezhaService_ReportSystemStateServe
 		return StateStreamLease{}
 	}
 	runtimeHolderInitMu.Lock()
-	defer runtimeHolderInitMu.Unlock()
 	holder := s.runtime.Load()
 	if holder == nil {
 		candidate := &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), host: cloneHost(s.Host), lastActive: s.LastActive, prevIn: s.PrevTransferInSnapshot, prevOut: s.PrevTransferOutSnapshot}
@@ -340,11 +351,33 @@ func (s *Server) AttachStateStream(stream pb.NezhaService_ReportSystemStateServe
 			holder = s.runtime.Load()
 		}
 	}
+	// leaseMu may be held across a database call: never wait for it under the
+	// global runtimeHolderInitMu, which every server's RuntimeSnapshot needs.
+	runtimeHolderInitMu.Unlock()
+	holder.leaseMu.Lock()
+	defer holder.leaseMu.Unlock()
 	holder.mu.Lock()
 	defer holder.mu.Unlock()
 	holder.generation++
 	holder.stream = stream
 	return StateStreamLease{holder: holder, generation: holder.generation}
+}
+
+// RevokeStateStream ends the agent's ReportSystemState session from the
+// dashboard side. The stream authenticates only when it is opened, so this is
+// how a credential that stops being valid is taken away from a stream that is
+// already open: the lease handed out by AttachStateStream stops being current
+// and can neither update nor clear the runtime state any more.
+func (s *Server) RevokeStateStream() {
+	holder := s.RuntimeHandle().holder
+	holder.mu.Lock()
+	defer holder.mu.Unlock()
+	holder.generation++
+	holder.stream = nil
+	holder.lastActive = time.Time{}
+	if holder.canonical != nil {
+		holder.canonical.LastActive = time.Time{}
+	}
 }
 
 func (s *Server) UpdateStateIfCurrent(lease StateStreamLease, state *HostState, lastActive time.Time) bool {
@@ -538,12 +571,16 @@ func (s *Server) AfterFind(tx *gorm.DB) error {
 			return nil
 		}
 	}
+	// 重复 profile ID 会让 UpdateDDNS 为同一 profile 重复起 goroutine 外呼
+	// （GHSA-8fgr-wx8p-v6q7），读取时收敛历史膨胀数据。
+	s.DDNSProfiles = UniqueIDs(s.DDNSProfiles)
 	if s.OverrideDDNSDomainsRaw != "" {
 		if err := json.Unmarshal([]byte(s.OverrideDDNSDomainsRaw), &s.OverrideDDNSDomains); err != nil {
 			log.Println("NEZHA>> Server.AfterFind:", err)
 			return nil
 		}
 	}
+	s.OverrideDDNSDomains = PruneOverrideDDNSDomains(s.OverrideDDNSDomains, s.DDNSProfiles)
 	return nil
 }
 

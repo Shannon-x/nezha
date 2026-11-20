@@ -117,6 +117,16 @@ func payloadFunc() func(data any) jwt.MapClaims {
 
 func identityHandler() func(c *gin.Context) any {
 	return func(c *gin.Context) any {
+		// The dashboard sets nz-jwt once and host-only, so a request carries it
+		// twice only when another host under the same parent domain (e.g. a
+		// member NAT domain) planted a second one with Domain=<parent>. gin-jwt
+		// reads the first, and a longer Path lists the planted one first, so
+		// that host would choose the account this request runs as. Such a
+		// request has no trustworthy session: authenticate nobody.
+		if len(c.Request.CookiesNamed("nz-jwt")) > 1 {
+			return nil
+		}
+
 		claims := jwt.ExtractClaims(c)
 
 		keyID, ok := claims[jwtClaimKeyID].(string)
@@ -171,6 +181,23 @@ func identityHandler() func(c *gin.Context) any {
 		c.Set(jwtClaimKeyID, keyID)
 		return &user
 	}
+}
+
+// jwtSessionStillLive repeats on tx what identityHandler checked when the
+// request arrived: the session belongs to the user, is neither revoked nor
+// expired, and was issued for the user's current token_version. A handler
+// that waits for a third party between authentication and a write calls it
+// first in the transaction of that write, so that it does not act for a
+// session that was revoked while it waited. The check is one conditional
+// UPDATE, so the transaction starts as a writer and needs no SQLite
+// read-to-write lock upgrade.
+func jwtSessionStillLive(tx *gorm.DB, keyID string, userID uint64) bool {
+	now := time.Now()
+	live := tx.Model(&model.JWTSession{}).
+		Where("key_id = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?", keyID, userID, now).
+		Where("token_version = (?)", tx.Model(&model.User{}).Select("token_version").Where("id = ?", userID)).
+		Update("last_used_at", now)
+	return live.Error == nil && live.RowsAffected == 1
 }
 
 // User Login

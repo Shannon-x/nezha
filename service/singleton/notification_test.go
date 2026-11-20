@@ -352,6 +352,61 @@ func TestServiceStateCancelStopsOldConfiguration(t *testing.T) {
 	}
 }
 
+func TestServiceStateCancelStopsWorkerWaitingForDeliveryKey(t *testing.T) {
+	oldCache := Cache
+	Cache = cache.New(time.Minute, time.Minute)
+	t.Cleanup(func() { Cache = oldCache })
+	n := &model.Notification{Common: model.Common{ID: 545}, Name: "hook"}
+	nc := newNotificationClassWithItems(n)
+	nc.UpdateGroup(&model.NotificationGroup{Common: model.Common{ID: 546}, Name: "stalled-group"}, []uint64{n.ID})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	nc.sendForTest = func(*model.Notification, string, *model.Server) error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return errors.New("stalled webhook gave up")
+	}
+	worker := func() *orderedServiceDelivery {
+		nc.deliveryMu.Lock()
+		defer nc.deliveryMu.Unlock()
+		return nc.serviceDelivery[547]
+	}
+	nc.SendServiceState(547, 546, "down", "same-event")
+	<-entered
+	first := worker()
+	nc.CancelServiceState(547)
+	// The monitor is still down after the edit, so the next report starts a
+	// second worker that queues behind the first one's delivery key.
+	nc.SendServiceState(547, 546, "still down", "same-event")
+	second := worker()
+	deadline := time.Now().Add(time.Second)
+	for waiting := false; !waiting; {
+		if time.Now().After(deadline) {
+			t.Fatal("second worker did not reach the delivery key")
+		}
+		nc.deliveryMu.Lock()
+		for _, key := range nc.deliveryKeys {
+			waiting = key.refs == 2
+		}
+		nc.deliveryMu.Unlock()
+	}
+	nc.CancelServiceState(547)
+	close(release)
+	for _, state := range []*orderedServiceDelivery{first, second} {
+		select {
+		case <-state.done:
+		case <-time.After(time.Second):
+			t.Fatal("canceled worker did not exit")
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("canceled worker still delivered: %d requests, want 1", got)
+	}
+}
+
 func TestServiceUpdateCancelsOldRecipientRetry(t *testing.T) {
 	ss := newServiceMonitorSecurityHarness(t)
 	service := &model.Service{
@@ -398,6 +453,67 @@ func TestServiceUpdateCancelsOldRecipientRetry(t *testing.T) {
 	if remaining != 0 {
 		t.Fatal("old recipient retained after service update")
 	}
+}
+
+func TestSendNotificationUsesCurrentRecipientsDuringDelivery(t *testing.T) {
+	newGroup := func() (*NotificationClass, *model.NotificationGroup, []*model.Notification) {
+		items := []*model.Notification{
+			{Common: model.Common{ID: 571}, Name: "a", URL: "https://old.example/a"},
+			{Common: model.Common{ID: 572}, Name: "b", URL: "https://old.example/b"},
+			{Common: model.Common{ID: 573}, Name: "c", URL: "https://old.example/c"},
+			{Common: model.Common{ID: 574}, Name: "d", URL: "https://old.example/d"},
+		}
+		nc := newNotificationClassWithItems(items...)
+		group := &model.NotificationGroup{Common: model.Common{ID: 575}, Name: "in-flight"}
+		nc.UpdateGroup(group, []uint64{571, 572, 573, 574})
+		return nc, group, items
+	}
+
+	t.Run("deleted, ungrouped and edited methods", func(t *testing.T) {
+		nc, group, items := newGroup()
+		var later []*model.Notification
+		var edited *model.Notification
+		calls := 0
+		nc.sendForTest = func(n *model.Notification, _ string, _ *model.Server) error {
+			if calls++; calls > 1 {
+				later = append(later, n)
+				return nil
+			}
+			// While the first recipient is being contacted, the owner deletes
+			// one of the others, takes one out of the group and edits the third.
+			var rest []*model.Notification
+			for _, item := range items {
+				if item.ID != n.ID {
+					rest = append(rest, item)
+				}
+			}
+			nc.Delete([]uint64{rest[0].ID})
+			nc.UpdateGroup(group, []uint64{n.ID, rest[2].ID})
+			edited = &model.Notification{Common: model.Common{ID: rest[2].ID}, Name: rest[2].Name, URL: "https://new.example/"}
+			nc.Update(edited)
+			return nil
+		}
+		if !nc.SendNotification(group.ID, "message", "") {
+			t.Fatal("recipients removed during the delivery must not count as failed")
+		}
+		if len(later) != 1 || later[0] != edited {
+			t.Fatalf("after the change %d deliveries were made, want one to the edited method only", len(later))
+		}
+	})
+
+	t.Run("deleted group", func(t *testing.T) {
+		nc, group, _ := newGroup()
+		calls := 0
+		nc.sendForTest = func(*model.Notification, string, *model.Server) error {
+			calls++
+			nc.DeleteGroup([]uint64{group.ID})
+			return nil
+		}
+		nc.SendNotification(group.ID, "message", "")
+		if calls != 1 {
+			t.Fatalf("%d deliveries were made although the group was deleted during the first", calls)
+		}
+	})
 }
 
 func newNotificationClassWithItems(items ...*model.Notification) *NotificationClass {
@@ -515,5 +631,50 @@ func TestNotificationClassGroupMutationsDoNotDeadlock(t *testing.T) {
 		case <-timer.C:
 			t.Fatal("concurrent UpdateGroup and DeleteGroup deadlocked")
 		}
+	}
+}
+
+func TestIPChangeNotificationQuotaBoundsServerAndMemberOwner(t *testing.T) {
+	oldCache := Cache
+	Cache = cache.New(time.Minute, time.Minute)
+	t.Cleanup(func() { Cache = oldCache })
+	UserLock.Lock()
+	oldUsers := UserInfoMap
+	UserInfoMap = map[uint64]model.UserInfo{100: {Role: model.RoleAdmin}, 200: {Role: model.RoleMember}}
+	UserLock.Unlock()
+	t.Cleanup(func() {
+		UserLock.Lock()
+		UserInfoMap = oldUsers
+		UserLock.Unlock()
+	})
+	allowed := func(id, ownerID uint64, reports int) (count int) {
+		server := &model.Server{Common: model.Common{ID: id, UserID: ownerID}}
+		for range reports {
+			if AllowIPChangeNotification(server) {
+				count++
+			}
+		}
+		return count
+	}
+
+	if got := allowed(1, 200, 100); got != ipChangeNotificationServerQuota {
+		t.Fatalf("flapping member server raised %d notifications, want %d", got, ipChangeNotificationServerQuota)
+	}
+	// Enrolling more servers must not buy the member more notifications.
+	total := ipChangeNotificationServerQuota
+	for id := uint64(2); id < 100; id++ {
+		total += allowed(id, 200, 1)
+	}
+	if total != ipChangeNotificationOwnerQuota {
+		t.Fatalf("member fleet raised %d notifications, want %d", total, ipChangeNotificationOwnerQuota)
+	}
+	// Admin-owned servers, including legacy owner 0, are only bounded per server.
+	for id := uint64(100); id < 200; id++ {
+		if got := allowed(id, (id%2)*100, 1); got != 1 {
+			t.Fatalf("admin server %d was suppressed by another server's changes", id)
+		}
+	}
+	if got := allowed(100, 0, 100); got != ipChangeNotificationServerQuota-1 {
+		t.Fatalf("flapping admin server raised %d more notifications, want %d", got, ipChangeNotificationServerQuota-1)
 	}
 }

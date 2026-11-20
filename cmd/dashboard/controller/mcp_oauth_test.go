@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/nezhahq/nezha/service/singleton"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestMCPOAuthDiscoveryThroughDashboardRouter(t *testing.T) {
@@ -54,9 +55,11 @@ func setupMCPOAuthSession(t *testing.T) *mcpOAuthTestSession {
 	// concurrent code exchanges. Exercise the same shared file as production.
 	cleanup, uid := setupMCPTestWithDatabase(t, filepath.Join(t.TempDir(), "mcp-oauth.sqlite"))
 	t.Cleanup(cleanup)
-	oldLimiter, oldRegistrationLimiter := mcpOAuthPublicLimiter, mcpOAuthRegistrationLimiter
-	mcpOAuthPublicLimiter, mcpOAuthRegistrationLimiter = newMCPRateLimiter(10000, 10000), newMCPRateLimiter(10000, 10000)
-	t.Cleanup(func() { mcpOAuthPublicLimiter, mcpOAuthRegistrationLimiter = oldLimiter, oldRegistrationLimiter })
+	oldLimiter, oldCallerLimiter, oldRegistrationLimiter := mcpOAuthPublicLimiter, mcpOAuthCallerLimiter, mcpOAuthRegistrationLimiter
+	mcpOAuthPublicLimiter, mcpOAuthCallerLimiter, mcpOAuthRegistrationLimiter = newMCPRateLimiter(10000, 10000), newMCPRateLimiter(10000, 10000), newMCPRateLimiter(10000, 10000)
+	t.Cleanup(func() {
+		mcpOAuthPublicLimiter, mcpOAuthCallerLimiter, mcpOAuthRegistrationLimiter = oldLimiter, oldCallerLimiter, oldRegistrationLimiter
+	})
 	singleton.Conf.JWTSecretKey = "mcp-oauth-integration-test-signing-key"
 	require.NoError(t, idcodec.Init([]byte(singleton.Conf.JWTSecretKey)))
 	require.NoError(t, singleton.DB.AutoMigrate(&model.MCPOAuthClient{}, &model.MCPOAuthCode{}, &model.MCPOAuthGrant{}, &model.JWTSession{}))
@@ -261,17 +264,12 @@ func TestMCPOAuthRejectsInvalidAuthorizationParameters(t *testing.T) {
 			s := setupMCPOAuthSession(t)
 			s.query.Set(scenario.field, scenario.value)
 			response := s.request(t, "GET", mcpOAuthPath+"/authorize?"+s.query.Encode(), nil, false)
+			require.Equal(t, 400, response.Code)
+			require.Empty(t, response.Header().Get("Location"))
 			if scenario.field == "redirect_uri" || scenario.field == "client_id" {
-				require.Equal(t, 400, response.Code)
-				require.Empty(t, response.Header().Get("Location"))
 				require.Contains(t, response.Body.String(), "invalid_request")
 			} else {
-				require.Equal(t, http.StatusFound, response.Code)
-				callback, err := url.Parse(response.Header().Get("Location"))
-				require.NoError(t, err)
-				require.Equal(t, "chatgpt.com", callback.Host)
-				require.NotEmpty(t, callback.Query().Get("error"))
-				require.Empty(t, callback.Query().Get("code"))
+				require.Contains(t, response.Body.String(), `"error":`)
 			}
 		})
 	}
@@ -342,6 +340,16 @@ func TestMCPOAuthDenialAndLoginBinding(t *testing.T) {
 	require.Error(t, err)
 }
 
+// The permission row behind a grant is authenticated like any API Token, so it
+// has to carry the owner's credential version as well as the grant does.
+func TestMCPOAuthGrantUsableAfterEarlierCredentialChange(t *testing.T) {
+	s := setupMCPOAuthSession(t)
+	require.NoError(t, singleton.DB.Model(&model.User{}).Where("id = ?", s.userID).Update("token_version", 4).Error)
+	require.NoError(t, singleton.DB.Model(&model.JWTSession{}).Where("user_id = ?", s.userID).Update("token_version", 4).Error)
+	tokens := s.tokens(t)
+	require.Equal(t, http.StatusOK, s.rpc(t, tokens.AccessToken, "initialize", nil).Code)
+}
+
 func TestMCPOAuthCodeExchangeBindingsAndReuse(t *testing.T) {
 	s := setupMCPOAuthSession(t)
 	code := s.approve(t)
@@ -391,6 +399,46 @@ func TestMCPOAuthRefreshRotationReplayAndRevocation(t *testing.T) {
 	require.Equal(t, 401, s.rpc(t, tokens.AccessToken, "initialize", nil).Code)
 	refresh.Set("refresh_token", tokens.RefreshToken)
 	require.Equal(t, 400, s.request(t, "POST", mcpOAuthPath+"/token", refresh, false).Code)
+}
+
+// A writer outside the OAuth mutex (here the last_used_at update every /mcp
+// request performs) must delay a refresh replay, not make its revocation vanish.
+func TestMCPOAuthRefreshReplayRevokesWhileAnotherWriterHoldsTheDatabase(t *testing.T) {
+	s := setupMCPOAuthSession(t)
+	tokens := s.tokens(t)
+	refresh := url.Values{"grant_type": {"refresh_token"}, "client_id": {s.clientID}, "resource": {"https://example.com/mcp"}, "refresh_token": {tokens.RefreshToken}}
+	response := s.request(t, "POST", mcpOAuthPath+"/token", refresh, false)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	var rotated mcpOAuthTokenResponse
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &rotated))
+
+	writing, done := make(chan struct{}), make(chan error, 1)
+	go func() {
+		done <- singleton.DB.Transaction(func(tx *gorm.DB) error {
+			err := tx.Model(&model.APIToken{}).Where("user_id = ?", s.userID).Update("last_used_at", time.Now()).Error
+			close(writing)
+			time.Sleep(300 * time.Millisecond)
+			return err
+		})
+	}()
+	<-writing
+	replay := s.request(t, "POST", mcpOAuthPath+"/token", refresh, false)
+	require.NoError(t, <-done)
+	require.Equal(t, 400, replay.Code)
+	require.Contains(t, replay.Body.String(), "invalid_grant")
+	require.Equal(t, 401, s.rpc(t, rotated.AccessToken, "initialize", nil).Code, "refresh replay revokes the token family")
+}
+
+func TestMCPOAuthTokenStorageFailureIsNotInvalidGrant(t *testing.T) {
+	s := setupMCPOAuthSession(t)
+	tokens := s.tokens(t)
+	require.NoError(t, singleton.DB.Migrator().RenameTable("mcp_oauth_grants", "mcp_oauth_grants_unavailable"))
+	refresh := url.Values{"grant_type": {"refresh_token"}, "client_id": {s.clientID}, "resource": {"https://example.com/mcp"}, "refresh_token": {tokens.RefreshToken}}
+	failed := s.request(t, "POST", mcpOAuthPath+"/token", refresh, false)
+	require.Equal(t, 503, failed.Code, failed.Body.String())
+	require.Contains(t, failed.Body.String(), "temporarily_unavailable")
+	require.NoError(t, singleton.DB.Migrator().RenameTable("mcp_oauth_grants_unavailable", "mcp_oauth_grants"))
+	require.Equal(t, 200, s.request(t, "POST", mcpOAuthPath+"/token", refresh, false).Code, "a failed attempt must not consume the refresh token")
 }
 
 func TestMCPOAuthTokenLifecycleConstraints(t *testing.T) {
@@ -468,6 +516,70 @@ func TestMCPOAuthClientRegistrationAndAuthentication(t *testing.T) {
 			require.Contains(t, response.Body.String(), "access_token")
 		})
 	}
+}
+
+// Registrations that are never used, or that an administrator disabled, must
+// not close registration to new clients once the client table is full.
+func TestMCPOAuthRegistrationRecyclesIdleClientsAtCapacity(t *testing.T) {
+	s := setupMCPOAuthSession(t)
+	s.tokens(t) // the client registered by the setup now owns a grant
+	register := func(name string) int {
+		return s.request(t, "POST", mcpOAuthPath+"/register", map[string]any{"client_name": name, "redirect_uris": []string{"https://client.example/callback"}, "token_endpoint_auth_method": "none"}, false).Code
+	}
+	stored := func(id string) bool {
+		var count int64
+		require.NoError(t, singleton.DB.Model(&model.MCPOAuthClient{}).Where("id = ?", id).Count(&count).Error)
+		return count == 1
+	}
+	enabled := func() int64 {
+		var count int64
+		require.NoError(t, singleton.DB.Model(&model.MCPOAuthClient{}).Where("disabled = ?", false).Count(&count).Error)
+		return count
+	}
+	now := time.Now()
+	// The protected clients are the least recently used ones, so only their
+	// grant, code or disabled state keeps them from being recycled first.
+	require.NoError(t, singleton.DB.Model(&model.MCPOAuthClient{}).Where("id = ?", s.clientID).Update("last_used_at", now.Add(-80*24*time.Hour)).Error)
+	clients := []model.MCPOAuthClient{
+		{ID: "pending", RedirectURIs: "[]", AuthMethod: "none", LastUsedAt: now.Add(-80 * 24 * time.Hour)},
+		{ID: "disabled", RedirectURIs: "[]", AuthMethod: "none", LastUsedAt: now.Add(-80 * 24 * time.Hour), Disabled: true},
+	}
+	for i := len(clients); i < mcpOAuthClientLimit-1; i++ {
+		clients = append(clients, model.MCPOAuthClient{ID: "idle-" + strconv.Itoa(i), RedirectURIs: "[]", AuthMethod: "none", LastUsedAt: now.Add(-time.Duration(i) * time.Minute)})
+	}
+	oldest, secondOldest := clients[len(clients)-1].ID, clients[len(clients)-2].ID
+	require.NoError(t, singleton.DB.CreateInBatches(clients, 500).Error)
+	require.NoError(t, singleton.DB.Create(&model.MCPOAuthCode{Hash: "pending-code", ClientID: "pending", ExpiresAt: now.Add(mcpOAuthCodeLifetime)}).Error)
+
+	// The disabled record does not take up capacity, so the last free slot is used.
+	require.EqualValues(t, mcpOAuthClientLimit-1, enabled())
+	require.Equal(t, http.StatusCreated, register("fills the last slot"))
+	require.True(t, stored(oldest))
+
+	for _, evicted := range []string{oldest, secondOldest} {
+		require.Equal(t, http.StatusCreated, register("new client while the table is full"))
+		require.False(t, stored(evicted), "the least recently used idle registration is recycled")
+		require.EqualValues(t, mcpOAuthClientLimit, enabled())
+	}
+	for _, kept := range []string{s.clientID, "pending", "disabled"} {
+		require.True(t, stored(kept), kept)
+	}
+
+	// Re-enabling a client must not raise the bound for good.
+	require.NoError(t, singleton.DB.Model(&model.MCPOAuthClient{}).Where("id = ?", "disabled").Update("disabled", false).Error)
+	require.Equal(t, http.StatusCreated, register("new client after a client was re-enabled"))
+	require.EqualValues(t, mcpOAuthClientLimit, enabled())
+
+	// Capacity is still a hard bound when every registration is in use.
+	var idle []string
+	require.NoError(t, singleton.DB.Model(&model.MCPOAuthClient{}).Where("disabled = ? AND id NOT IN ?", false, []string{s.clientID, "pending"}).Pluck("id", &idle).Error)
+	grants := make([]model.MCPOAuthGrant, 0, len(idle))
+	for i, id := range idle {
+		grants = append(grants, model.MCPOAuthGrant{ID: "grant-" + strconv.Itoa(i), APITokenID: uint64(1000000 + i), ClientID: id, AccessHash: "access-" + strconv.Itoa(i), ExpiresAt: now.Add(mcpOAuthGrantLifetime)})
+	}
+	require.NoError(t, singleton.DB.CreateInBatches(grants, 500).Error)
+	require.Equal(t, http.StatusServiceUnavailable, register("no registration can be recycled"))
+	require.EqualValues(t, mcpOAuthClientLimit, enabled())
 }
 
 func TestMCPOAuthExpiredAndCrossClientGrants(t *testing.T) {
@@ -594,6 +706,28 @@ func TestMCPOAuthMetadataCanonicalOriginAndBrowserHeaders(t *testing.T) {
 	require.Equal(t, 200, s.rpc(t, pat, "initialize", nil).Code, "OAuth configuration must not break existing PAT clients")
 }
 
+func TestMCPOAuthConsentDocumentIsNeverFrameable(t *testing.T) {
+	s := setupMCPOAuthSession(t)
+	// Only GET on the exact path is a registered route; everything else reaches
+	// the same admin frontend document through NoRoute.
+	for _, target := range []struct{ method, path string }{
+		{"GET", mcpOAuthFrontendPath},
+		{"POST", mcpOAuthFrontendPath},
+		{"PUT", mcpOAuthFrontendPath},
+		{"GET", "/dashboard/mcp/Authorize"},
+		{"GET", mcpOAuthFrontendPath + "//"},
+		{"GET", "/dashboard//mcp/authorize"},
+		{"GET", "/dashboard/index.html"},
+		{"GET", "/dashboard/"},
+	} {
+		page := s.request(t, target.method, target.path+"?"+s.query.Encode(), nil, false)
+		require.Contains(t, page.Body.String(), "independent admin frontend", "%s %s", target.method, target.path)
+		require.Equal(t, "DENY", page.Header().Get("X-Frame-Options"), "%s %s", target.method, target.path)
+		require.Equal(t, "frame-ancestors 'none'", page.Header().Get("Content-Security-Policy"), "%s %s", target.method, target.path)
+	}
+	require.Equal(t, "no-referrer", s.request(t, "GET", mcpOAuthFrontendPath, nil, false).Header().Get("Referrer-Policy"))
+}
+
 func TestMCPOAuthToolAnnotationsPreserveWriteConfirmation(t *testing.T) {
 	seen := make(map[string]bool)
 	for _, tool := range buildToolDescriptors() {
@@ -703,20 +837,152 @@ func TestMCPOAuthBearerSchemeIsCaseInsensitive(t *testing.T) {
 	}
 }
 
-func TestMCPOAuthAuthorizationErrorsReturnToTrustedClient(t *testing.T) {
+// Anyone can register a client, so the authorization endpoint must not forward
+// a visitor to a registered callback before a logged-in user has reviewed it:
+// request errors are reported here, even for approved or disabled clients.
+func TestMCPOAuthAuthorizationErrorsDoNotRedirectToClient(t *testing.T) {
 	for _, scenario := range []struct{ field, value, code string }{{"scope", "unavailable:scope", "invalid_scope"}, {"response_type", "token", "unsupported_response_type"}, {"code_challenge_method", "plain", "invalid_request"}, {"resource", "https://other.example/mcp", "invalid_target"}} {
 		t.Run(scenario.field, func(t *testing.T) {
 			s := setupMCPOAuthSession(t)
-			s.query.Set(scenario.field, scenario.value)
-			response := s.request(t, "GET", mcpOAuthPath+"/authorize?"+s.query.Encode(), nil, false)
-			require.Equal(t, http.StatusFound, response.Code)
-			callback, err := url.Parse(response.Header().Get("Location"))
-			require.NoError(t, err)
-			require.Equal(t, "https://chatgpt.com/connector_platform_oauth_redirect", callback.Scheme+"://"+callback.Host+callback.Path)
-			require.Equal(t, scenario.code, callback.Query().Get("error"))
-			require.Equal(t, "client-state", callback.Query().Get("state"))
-			require.Equal(t, "https://example.com", callback.Query().Get("iss"))
-			require.Empty(t, callback.Query().Get("code"))
+			invalid := url.Values{}
+			for name, values := range s.query {
+				invalid[name] = values
+			}
+			invalid.Set(scenario.field, scenario.value)
+			check := func() {
+				t.Helper()
+				response := s.request(t, "GET", mcpOAuthPath+"/authorize?"+invalid.Encode(), nil, false)
+				require.Equal(t, http.StatusBadRequest, response.Code)
+				require.Empty(t, response.Header().Get("Location"))
+				var body map[string]string
+				require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+				require.Equal(t, scenario.code, body["error"])
+				require.NotEmpty(t, body["error_description"])
+			}
+			check()
+			s.tokens(t)
+			check()
 		})
 	}
+	s := setupMCPOAuthSession(t)
+	require.NoError(t, singleton.DB.Model(&model.User{}).Where("id = ?", s.userID).Update("role", model.RoleAdmin).Error)
+	disable := s.request(t, "PUT", "/api/v1/mcp/oauth/clients/"+s.clientID, map[string]any{"disabled": true}, true)
+	require.Contains(t, disable.Body.String(), `"success":true`)
+	response := s.request(t, "GET", mcpOAuthPath+"/authorize?"+s.query.Encode(), nil, false)
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Empty(t, response.Header().Get("Location"))
+	require.Contains(t, response.Body.String(), "unauthorized_client")
+}
+
+// Anonymous requests must not spend the rate budget of logged-in users or of
+// clients presenting credentials that only a user's consent can produce.
+func TestMCPOAuthAnonymousTrafficDoesNotStarveIdentifiedCallers(t *testing.T) {
+	s := setupMCPOAuthSession(t)
+	tokens := s.tokens(t)
+	pendingCode := s.approve(t)
+	refresh := func(token string) url.Values {
+		return url.Values{"grant_type": {"refresh_token"}, "client_id": {s.clientID}, "resource": {"https://example.com/mcp"}, "refresh_token": {token}}
+	}
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	mcpOAuthPublicLimiter = newMCPRateLimiterWithClock(20, 300, clock)
+	mcpOAuthCallerLimiter = newMCPRateLimiterWithClock(20, 300, clock)
+	discovery := func() int {
+		return s.request(t, "GET", "/.well-known/oauth-authorization-server", nil, false).Code
+	}
+	for range 300 {
+		now = now.Add(50 * time.Millisecond)
+		require.Equal(t, 200, discovery())
+	}
+	now = now.Add(2 * time.Second)
+	require.Equal(t, 429, discovery(), "the anonymous minute budget is spent")
+	require.Equal(t, 429, s.request(t, "POST", mcpOAuthPath+"/token", refresh("nzr_forged.handle.signature"), false).Code, "a forged handle stays anonymous")
+	require.Equal(t, 429, s.request(t, "POST", mcpOAuthPath+"/token", s.exchangeForm("forged.code"), false).Code, "a forged code stays anonymous")
+	require.Equal(t, 429, s.request(t, "POST", mcpOAuthPath+"/token", url.Values{"client_id": {"%zz"}}, false).Code, "a malformed form stays anonymous")
+
+	consent := s.request(t, "GET", "/api/v1/mcp/oauth/consent?"+s.query.Encode(), nil, true)
+	require.Equal(t, 200, consent.Code)
+	require.Contains(t, consent.Body.String(), `"success":true`)
+	require.Equal(t, 200, s.request(t, "POST", mcpOAuthPath+"/token", s.exchangeForm(pendingCode), false).Code)
+	response := s.request(t, "POST", mcpOAuthPath+"/token", refresh(tokens.RefreshToken), false)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	var rotated mcpOAuthTokenResponse
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &rotated))
+	require.Equal(t, 200, s.request(t, "POST", mcpOAuthPath+"/revoke", url.Values{"client_id": {s.clientID}, "token": {rotated.RefreshToken}}, false).Code)
+	require.Equal(t, 401, s.rpc(t, rotated.AccessToken, "initialize", nil).Code)
+
+	// A caller's own bucket is still bounded and does not leak into others.
+	for range 20 {
+		s.request(t, "POST", mcpOAuthPath+"/token", refresh(rotated.RefreshToken), false)
+	}
+	require.Equal(t, 429, s.request(t, "POST", mcpOAuthPath+"/token", refresh(rotated.RefreshToken), false).Code)
+	require.Equal(t, 200, s.request(t, "GET", "/api/v1/mcp/oauth/consent?"+s.query.Encode(), nil, true).Code)
+}
+
+func TestMCPOAuthMalformedCredentialFormIsRejected(t *testing.T) {
+	s := setupMCPOAuthSession(t)
+	tokens := s.tokens(t)
+	for _, path := range []string{"/token", "/revoke"} {
+		request := httptest.NewRequest("POST", "https://example.com"+mcpOAuthPath+path, strings.NewReader("client_id="+s.clientID+"&token="+tokens.RefreshToken+"&bad=%zz"))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		s.router.ServeHTTP(response, request)
+		require.Equal(t, 401, response.Code, path)
+		require.Contains(t, response.Body.String(), "invalid_client", path)
+	}
+	require.Equal(t, 200, s.rpc(t, tokens.AccessToken, "initialize", nil).Code, "a malformed revocation must not be processed")
+}
+
+func TestMCPOAuthUnknownAccessTokenIsCountedByWAF(t *testing.T) {
+	s := setupMCPOAuthSession(t)
+	tokens := s.tokens(t)
+	// routers() does not install waf.RealIp, and BlockIP ignores an empty address.
+	s.router = gin.New()
+	s.router.Use(func(c *gin.Context) { c.Set(model.CtxKeyRealIPStr, "198.51.100.8") })
+	routers(s.router, fstest.MapFS{})
+	counted := func() uint64 {
+		var entry model.WAF
+		require.NoError(t, singleton.DB.Where("block_identifier = ?", model.BlockIDToken).Find(&entry).Error)
+		return entry.Count
+	}
+
+	require.Equal(t, 401, s.rpc(t, mcpOAuthAccessPrefix+"made-up", "initialize", nil).Code)
+	require.EqualValues(t, 1, counted())
+	require.Equal(t, 401, s.rpc(t, mcpOAuthAccessPrefix+strings.Repeat("x", 128), "initialize", nil).Code)
+	require.EqualValues(t, 2, counted())
+
+	require.Equal(t, 200, s.rpc(t, tokens.AccessToken, "initialize", nil).Code)
+	require.Zero(t, counted(), "a valid token clears the counter")
+
+	// An issued token that merely expired must not block its holder's refresh.
+	require.NoError(t, singleton.DB.Model(&model.MCPOAuthGrant{}).Where("1 = 1").Update("access_expires_at", time.Now().Add(-time.Second)).Error)
+	require.Equal(t, 401, s.rpc(t, tokens.AccessToken, "initialize", nil).Code)
+	require.Zero(t, counted())
+}
+
+// The cap of 100 authorizations per user is counted on mcp_oauth_grants. A
+// member's personal API tokens share api_tokens with the OAuth permission
+// identities, have no quota and may be named "OAuth: ..." by their owner, so
+// they must neither be read under the write lock nor use up the cap.
+func TestMCPOAuthGrantCapCountsGrantsNotAPITokens(t *testing.T) {
+	s := setupMCPOAuthSession(t)
+	expiry := time.Now().Add(time.Hour)
+	for i := range 100 {
+		require.NoError(t, singleton.DB.Create(&model.APIToken{UserID: s.userID, Name: "OAuth: personal", TokenHash: model.HashAPIToken("personal-" + strconv.Itoa(i)), ExpiresAt: &expiry}).Error)
+	}
+	s.tokens(t)
+	var grant model.MCPOAuthGrant
+	require.NoError(t, singleton.DB.First(&grant).Error)
+	require.Equal(t, s.userID, grant.UserID)
+
+	for i := range 99 {
+		name := "filler-" + strconv.Itoa(i)
+		permission := model.APIToken{UserID: s.userID, Name: "renamed by its owner", TokenHash: model.HashAPIToken(name), ExpiresAt: &expiry}
+		require.NoError(t, singleton.DB.Create(&permission).Error)
+		require.NoError(t, singleton.DB.Create(&model.MCPOAuthGrant{ID: name, APITokenID: permission.ID, UserID: s.userID, ClientID: s.clientID, AccessHash: model.HashAPIToken(name), ExpiresAt: expiry}).Error)
+	}
+	refused := s.request(t, "POST", mcpOAuthPath+"/token", s.exchangeForm(s.approve(t)), false)
+	require.Equal(t, 400, refused.Code, refused.Body.String())
+	require.Contains(t, refused.Body.String(), "invalid_grant")
 }

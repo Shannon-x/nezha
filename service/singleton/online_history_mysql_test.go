@@ -35,7 +35,8 @@ func TestOnlineHistoryLifecycleOnMySQL(t *testing.T) {
 	require.NoError(t, DB.AutoMigrate(&model.Server{}, &model.OnlineSession{}))
 	require.NoError(t, DB.Exec("INSERT INTO servers (id, name, uuid) VALUES (1, 'server-1', 'online-history-mysql-1')").Error)
 
-	t0 := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	// Recovery continues only sessions active within the last OnlineActiveWindow.
+	t0 := time.Now().UTC().Add(-20 * time.Second).Truncate(time.Second)
 	r := NewOnlineHistoryRecorder()
 	r.RecordOnline(1, t0)
 	sessions, err := r.Sessions(1, t0.Add(-time.Minute), t0.Add(time.Minute))

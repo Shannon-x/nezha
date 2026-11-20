@@ -63,6 +63,14 @@ func updateServer(c *gin.Context) (any, error) {
 	if err := c.ShouldBindJSON(&sf); err != nil {
 		return nil, err
 	}
+	// DDNSShared.CheckPermission 不去重；重复 ID 会让 UpdateDDNS 重复外呼
+	// （GHSA-8fgr-wx8p-v6q7）。必须在权限校验前规范化。
+	sf.DDNSProfiles = model.UniqueIDs(sf.DDNSProfiles)
+	overrideDomains, err := normalizeOverrideDDNSDomains(sf.OverrideDDNSDomains, sf.DDNSProfiles)
+	if err != nil {
+		return nil, err
+	}
+	sf.OverrideDDNSDomains = overrideDomains
 
 	if !singleton.DDNSShared.CheckPermission(c, slices.Values(sf.DDNSProfiles)) {
 		return nil, singleton.Localizer.ErrorT("permission denied")
@@ -73,7 +81,7 @@ func updateServer(c *gin.Context) (any, error) {
 		return nil, singleton.Localizer.ErrorT("server id %d does not exist", id)
 	}
 
-	if !s.HasPermission(c) {
+	if !s.HasPermission(c) || !serverRecordWritable(c, s.ID) {
 		return nil, singleton.Localizer.ErrorT("permission denied")
 	}
 
@@ -98,13 +106,15 @@ func updateServer(c *gin.Context) (any, error) {
 	}
 	s.OverrideDDNSDomainsRaw = string(overrideDomainsRaw)
 
-	if err := singleton.DB.Save(&s).Error; err != nil {
-		return nil, newGormError("%v", err)
+	// The server may have been deleted since First. A plain Save would insert
+	// the row again when its UPDATE matches nothing; with a Select it does not.
+	saved := singleton.DB.Select("*").Save(&s)
+	if saved.Error != nil {
+		return nil, newGormError("%v", saved.Error)
 	}
-
-	rs, _ := singleton.ServerShared.Get(s.ID)
-	s.CopyFromRunningServer(rs)
-	singleton.ServerShared.Update(&s, "")
+	if saved.RowsAffected == 0 || !singleton.ServerShared.Replace(&s) {
+		return nil, singleton.Localizer.ErrorT("server id %d does not exist", id)
+	}
 
 	return nil, nil
 }
@@ -127,6 +137,12 @@ func batchDeleteServer(c *gin.Context) (any, error) {
 	}
 
 	if !singleton.ServerShared.CheckPermission(c, slices.Values(servers)) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+	// Deleting a server mid-transfer cancels the transfer and frees its UUID
+	// for re-enrolment; the destination user does not own it until the agent
+	// has rotated.
+	if slices.ContainsFunc(servers, func(id uint64) bool { return !serverRecordWritable(c, id) }) {
 		return nil, singleton.Localizer.ErrorT("permission denied")
 	}
 
@@ -252,6 +268,15 @@ func getServerConfig(c *gin.Context) (string, error) {
 		return "", nil
 	}
 
+	// ConfigCache is one slot per server, not per request: a report whose
+	// reader disconnected or timed out stays in it. Drop it, so the answer can
+	// only be a report received after this caller was admitted. An older one
+	// may predate an ownership transfer and carry the previous owner's secret.
+	select {
+	case <-s.ConfigCache:
+	default:
+	}
+
 	if err := s.SendTaskGuarded(&pb.Task{
 		Type: model.TaskTypeReportConfig,
 	}, serverTaskAdmission(c, id)); err != nil {
@@ -269,6 +294,13 @@ func getServerConfig(c *gin.Context) (string, error) {
 	case <-timeout.C:
 		return "", singleton.Localizer.ErrorT("operation timeout")
 	case data := <-s.ConfigCache:
+		// Control was released for the wait, so ownership may have moved on
+		// and the report may already hold the next owner's credential.
+		releaseControl, controlErr := beginServerControl(c, id)
+		if controlErr != nil {
+			return "", controlErr
+		}
+		releaseControl()
 		switch data := data.(type) {
 		case string:
 			return data, nil
@@ -296,6 +328,8 @@ func setServerConfig(c *gin.Context) (*model.ServerTaskResponse, error) {
 	if err := c.ShouldBindJSON(&configForm); err != nil {
 		return nil, err
 	}
+	// 重复 ID 会向同一 agent 重复下发配置。
+	configForm.Servers = model.UniqueIDs(configForm.Servers)
 
 	var resp model.ServerTaskResponse
 	slist := singleton.ServerShared.GetList()
@@ -358,6 +392,13 @@ func setServerConfig(c *gin.Context) (*model.ServerTaskResponse, error) {
 	return &resp, nil
 }
 
+// batchMoveServerMaxIDs caps the id list of one batch-move request. Every
+// listed id, including unknown, foreign and repeated ones, is answered with
+// its own BatchMoveServerResult, so an unbounded list lets a small request
+// hold a response many times its size in memory. Matches the server_ids cap
+// of an API token.
+const batchMoveServerMaxIDs = 1000
+
 // Batch move servers to other user
 // @Summary Batch move servers to other user
 // @Security BearerAuth
@@ -373,6 +414,7 @@ func setServerConfig(c *gin.Context) (*model.ServerTaskResponse, error) {
 // @Description agent reconnects under the new secret (MarkVerified clears the
 // @Description pending window) or the transfer Cancel/Fail/Timeout-out and
 // @Description reverts Server.UserID to the source owner.
+// @Description At most 1000 server ids are accepted per request.
 // @Tags auth required
 // @Accept json
 // @Param request body model.BatchMoveServerForm true "BatchMoveServerForm"
@@ -383,6 +425,10 @@ func batchMoveServer(c *gin.Context) ([]model.BatchMoveServerResult, error) {
 	var moveForm model.BatchMoveServerForm
 	if err := c.ShouldBindJSON(&moveForm); err != nil {
 		return nil, err
+	}
+
+	if len(moveForm.Ids) > batchMoveServerMaxIDs {
+		return nil, singleton.Localizer.ErrorT("too many server ids (max %d)", batchMoveServerMaxIDs)
 	}
 
 	if moveForm.ToUser == 0 {
@@ -522,12 +568,10 @@ func getServerMetrics(c *gin.Context) (*model.ServerMetricsResponse, error) {
 	}
 
 	server, ok := singleton.ServerShared.Get(serverID)
-	if !ok {
+	// Hidden and unknown IDs deliberately share one response so sequential
+	// server IDs cannot be enumerated by callers who may not view them.
+	if !ok || server == nil || !userCanViewServer(c, server) {
 		return nil, singleton.Localizer.ErrorT("server not found")
-	}
-
-	if !userCanViewServer(c, server) {
-		return nil, singleton.Localizer.ErrorT("unauthorized")
 	}
 	_, isMember := c.Get(model.CtxKeyAuthorizedUser)
 

@@ -2,11 +2,15 @@ package singleton
 
 import (
 	"cmp"
+	"context"
 	"fmt"
+	"iter"
 	"log"
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/nezhahq/nezha/model"
 	"github.com/nezhahq/nezha/pkg/utils"
@@ -14,6 +18,13 @@ import (
 
 const (
 	firstNotificationDelay = time.Minute * 15
+
+	// IP change notifications are not muted, so every genuine change is
+	// reported. Genuine changes are rare; these quotas only stop an Agent
+	// that reports a different address on every call.
+	ipChangeNotificationWindow      = time.Hour
+	ipChangeNotificationServerQuota = 5
+	ipChangeNotificationOwnerQuota  = 20
 )
 
 type NotificationClass struct {
@@ -44,7 +55,8 @@ type orderedServiceDelivery struct {
 	current serviceDeliveryRequest
 	pending *serviceDeliveryRequest
 	update  chan struct{}
-	cancel  chan struct{}
+	ctx     context.Context
+	cancel  context.CancelFunc
 	done    chan struct{}
 }
 
@@ -59,7 +71,8 @@ func (c *NotificationClass) SendServiceState(serviceID, groupID uint64, desc, la
 	}
 	state := c.serviceDelivery[serviceID]
 	if state == nil {
-		state = &orderedServiceDelivery{current: req, update: make(chan struct{}, 1), cancel: make(chan struct{}), done: make(chan struct{})}
+		ctx, cancel := context.WithCancel(context.Background())
+		state = &orderedServiceDelivery{current: req, update: make(chan struct{}, 1), ctx: ctx, cancel: cancel, done: make(chan struct{})}
 		c.serviceDelivery[serviceID] = state
 		c.deliveryMu.Unlock()
 		go c.runServiceDelivery(serviceID, state)
@@ -81,14 +94,13 @@ func (c *NotificationClass) SendServiceState(serviceID, groupID uint64, desc, la
 
 func (c *NotificationClass) runServiceDelivery(serviceID uint64, state *orderedServiceDelivery) {
 	defer close(state.done)
+	defer state.cancel()
 	delay := 30 * time.Second
 	for {
-		select {
-		case <-state.cancel:
+		if state.ctx.Err() != nil {
 			return
-		default:
 		}
-		delivered := c.SendNotification(state.current.groupID, state.current.desc, state.current.label)
+		delivered := c.sendNotification(state.ctx, state.current.groupID, state.current.desc, state.current.label)
 		c.deliveryMu.Lock()
 		// Do not advance to a later phase until every recipient has received the
 		// current one. Otherwise a failed incident can be discarded as soon as a
@@ -115,7 +127,7 @@ func (c *NotificationClass) runServiceDelivery(serviceID uint64, state *orderedS
 		c.deliveryMu.Unlock()
 		timer := time.NewTimer(delay)
 		select {
-		case <-state.cancel:
+		case <-state.ctx.Done():
 			timer.Stop()
 			return
 		case <-state.update:
@@ -126,13 +138,17 @@ func (c *NotificationClass) runServiceDelivery(serviceID uint64, state *orderedS
 	}
 }
 
+// CancelServiceState stops the delivery worker of a service. Canceling the
+// context also ends a webhook request in flight and a wait for a delivery key:
+// the entry is removed here, so a worker left running would no longer be
+// counted and the next report would start another one beside it.
 func (c *NotificationClass) CancelServiceState(serviceID uint64) {
 	if c == nil {
 		return
 	}
 	c.deliveryMu.Lock()
 	if state := c.serviceDelivery[serviceID]; state != nil {
-		close(state.cancel)
+		state.cancel()
 		delete(c.serviceDelivery, serviceID)
 	}
 	c.deliveryMu.Unlock()
@@ -300,6 +316,22 @@ func NewNotificationClass() *NotificationClass {
 	return nc
 }
 
+// CheckBindPermission is strict for notification group bindings: unlike the
+// generic CheckPermission it refuses IDs the registry does not hold. A row that
+// is committed but not registered yet has no owner to compare against, and a
+// later database existence check must not turn it into an authorized binding.
+func (c *NotificationClass) CheckBindPermission(ctx *gin.Context, ids iter.Seq[uint64]) bool {
+	c.listMu.RLock()
+	defer c.listMu.RUnlock()
+	for id := range ids {
+		n, ok := c.list[id]
+		if !ok || !n.HasPermission(ctx) {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *NotificationClass) Update(n *model.Notification) {
 	func() {
 		c.listMu.Lock()
@@ -442,46 +474,65 @@ func notificationMethodMuteLabel(label string, id uint64) string {
 
 // SendNotification 向指定的通知方式组的所有通知方式发送通知
 func (c *NotificationClass) SendNotification(notificationGroupID uint64, desc string, muteLabel string, ext ...*model.Server) bool {
+	return c.sendNotification(context.Background(), notificationGroupID, desc, muteLabel, ext...)
+}
+
+func (c *NotificationClass) sendNotification(ctx context.Context, notificationGroupID uint64, desc string, muteLabel string, ext ...*model.Server) bool {
 	fullMuteLabel := ""
 	if muteLabel != "" {
 		fullMuteLabel = NotificationMuteLabel.AppendNotificationGroupName(muteLabel, c.GetGroupName(notificationGroupID))
 	}
 	// Copy the group under the lock. Webhook delivery can take minutes and must
 	// not block notification or notification-group updates while it is in flight.
+	// Only the IDs are kept: every recipient is resolved again right before its
+	// own delivery, so the copy cannot outlive a deletion or an edit.
 	c.listMu.RLock()
-	notifications := make([]*model.Notification, 0, len(c.groupToIDList[notificationGroupID]))
-	for _, n := range c.groupToIDList[notificationGroupID] {
-		notifications = append(notifications, n)
+	ids := make([]uint64, 0, len(c.groupToIDList[notificationGroupID]))
+	for id := range c.groupToIDList[notificationGroupID] {
+		ids = append(ids, id)
 	}
 	c.listMu.RUnlock()
 
-	if len(notifications) == 0 {
+	if len(ids) == 0 {
 		log.Printf("NEZHA>> Notification group %d has no recipients", notificationGroupID)
 		return false
 	}
 	allDelivered := true
-	for _, n := range notifications {
+	for _, id := range ids {
 		var server *model.Server
 		if len(ext) > 0 {
 			server = ext[0]
 		}
-		if !c.sendRecipient(n, desc, fullMuteLabel, server) {
+		if !c.sendRecipient(ctx, notificationGroupID, id, desc, fullMuteLabel, server) {
 			allDelivered = false
 		}
 	}
 	return allDelivered
 }
 
-func (c *NotificationClass) sendRecipient(n *model.Notification, desc, fullMuteLabel string, server *model.Server) bool {
-	if n == nil {
-		return false
-	}
+func (c *NotificationClass) sendRecipient(ctx context.Context, notificationGroupID, id uint64, desc, fullMuteLabel string, server *model.Server) bool {
 	cacheKey := ""
 	if fullMuteLabel != "" {
-		cacheKey = notificationMethodMuteLabel(fullMuteLabel, n.ID)
+		cacheKey = notificationMethodMuteLabel(fullMuteLabel, id)
 	}
 	unlock := c.lockDeliveryKey(cacheKey)
 	defer unlock()
+	if ctx.Err() != nil {
+		return false // canceled while waiting for the key, or before this recipient
+	}
+	// The deliveries to earlier recipients and the wait for the delivery key can
+	// each have taken minutes. Use the method as it is configured now: one that
+	// was deleted or removed from the group in the meantime must not be
+	// contacted, and an edited one must not be sent to its old URL or credential.
+	c.listMu.RLock()
+	n, ok := c.groupToIDList[notificationGroupID][id]
+	c.listMu.RUnlock()
+	if !ok {
+		return true // no longer a recipient, nothing left to deliver
+	}
+	if n == nil {
+		return false
+	}
 	var generation uint64
 	if cacheKey != "" {
 		c.deliveryMu.Lock()
@@ -502,7 +553,7 @@ func (c *NotificationClass) sendRecipient(n *model.Notification, desc, fullMuteL
 	if c.sendForTest != nil {
 		err = c.sendForTest(n, desc, server)
 	} else {
-		err = (&model.NotificationServerBundle{Notification: n, Server: server, Loc: Loc}).Send(desc)
+		err = (&model.NotificationServerBundle{Notification: n, Server: server, Loc: Loc}).SendContext(ctx, desc)
 	}
 	if err != nil {
 		// Webhook errors can contain a credential-bearing request URL. Keep
@@ -527,6 +578,34 @@ func (c *NotificationClass) sendRecipient(n *model.Notification, desc, fullMuteL
 	return true
 }
 
+// AllowIPChangeNotification reports whether server may raise another IP change
+// notification in the current window, and counts it if so. The address is the
+// Agent's own claim and any agent secret can enrol servers, so the quota is
+// kept per server and, unless an admin owns the server, per owner as well.
+func AllowIPChangeNotification(server *model.Server) bool {
+	if !consumeNotificationQuota(NotificationMuteLabel.IPChanged(server.ID), ipChangeNotificationServerQuota) {
+		return false
+	}
+	ownerID := server.GetUserID()
+	return userIsAdmin(ownerID) ||
+		consumeNotificationQuota(NotificationMuteLabel.IPChangedOwner(ownerID), ipChangeNotificationOwnerQuota)
+}
+
+func consumeNotificationQuota(key string, quota int) bool {
+	if Cache.Add(key, 1, ipChangeNotificationWindow) == nil {
+		return true
+	}
+	used, err := Cache.IncrementInt(key, 1)
+	if err != nil {
+		// The window expired between Add and IncrementInt.
+		return true
+	}
+	if used == quota+1 {
+		log.Printf("NEZHA>> IP change notification quota %s exhausted, suppressing further notifications", key)
+	}
+	return used <= quota
+}
+
 func notificationFailureSummary(err error) string {
 	// Even wrapped URL errors can include credentials in path/query. Log only
 	// the error type; the HTTP status path already returns a dedicated type.
@@ -539,6 +618,10 @@ var NotificationMuteLabel _NotificationMuteLabel
 
 func (_NotificationMuteLabel) IPChanged(serverId uint64) string {
 	return fmt.Sprintf("bf::ic-%d", serverId)
+}
+
+func (_NotificationMuteLabel) IPChangedOwner(userId uint64) string {
+	return fmt.Sprintf("bf::ico-%d", userId)
 }
 
 func (_NotificationMuteLabel) ServerIncident(alertId uint64, serverId uint64) string {

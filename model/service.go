@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"log"
+	"math"
 
 	"github.com/gin-gonic/gin"
 	"github.com/goccy/go-json"
@@ -59,6 +60,21 @@ func IsServiceMonitorType(t uint64) bool {
 func ValidateServiceMonitorType(t uint64) error {
 	if !IsServiceMonitorType(t) {
 		return fmt.Errorf("invalid service monitor type %d: allowed types are 1 (HTTP GET), 2 (ICMP ping), and 3 (TCP ping)", t)
+	}
+	return nil
+}
+
+// MaxServiceTargetBytes bounds Service.Target. The target becomes pb.Task.Data
+// and gRPC encodes a separate copy of it for every covered Agent at every tick;
+// a copy stays allocated until that Agent has taken it. Without a bound one
+// stored monitor costs (Agents x target size) bytes per tick.
+const MaxServiceTargetBytes = 4096
+
+// ValidateServiceTarget is checked wherever a Service is persisted, scheduled,
+// or dispatched, like ValidateServiceMonitorType.
+func ValidateServiceTarget(target string) error {
+	if len(target) > MaxServiceTargetBytes {
+		return fmt.Errorf("service target exceeds %d bytes", MaxServiceTargetBytes)
 	}
 	return nil
 }
@@ -329,12 +345,30 @@ func (m *Service) CronSpec() string {
 // MaxServiceDuration is the largest supported probe interval, in seconds.
 const MaxServiceDuration uint64 = 30 * 24 * 60 * 60
 
+// ValidateServiceLatency rejects thresholds that cannot be rendered as JSON.
+// With the go_json build tag a request number beyond the float32 range binds
+// as an infinity, which would poison the service list for every viewer.
+func ValidateServiceLatency(minLatency, maxLatency float32) error {
+	for _, latency := range [...]float32{minLatency, maxLatency} {
+		if math.IsNaN(float64(latency)) || math.IsInf(float64(latency), 0) {
+			return fmt.Errorf("service latency threshold must be a finite number")
+		}
+	}
+	return nil
+}
+
 func (m *Service) BeforeSave(tx *gorm.DB) error {
 	// Reject before persistence; a row that only fails cron registration can prevent restart.
 	if m.Duration > MaxServiceDuration {
 		return fmt.Errorf("service duration exceeds 30 days")
 	}
 	if err := ValidateServiceMonitorType(uint64(m.Type)); err != nil {
+		return err
+	}
+	if err := ValidateServiceLatency(m.MinLatency, m.MaxLatency); err != nil {
+		return err
+	}
+	if err := ValidateServiceTarget(m.Target); err != nil {
 		return err
 	}
 	if data, err := json.Marshal(m.SkipServers); err != nil {
@@ -361,6 +395,8 @@ func (m *Service) AfterFind(tx *gorm.DB) error {
 		log.Println("NEZHA>> Service.AfterFind:", err)
 		return nil
 	}
+	// 收敛历史上落库的 false 条目（GHSA-8fgr-wx8p-v6q7），见 reference_set.go。
+	m.SkipServers = EnabledIDSet(m.SkipServers)
 
 	// 加载触发任务列表
 	if err := json.Unmarshal([]byte(m.FailTriggerTasksRaw), &m.FailTriggerTasks); err != nil {
@@ -369,6 +405,9 @@ func (m *Service) AfterFind(tx *gorm.DB) error {
 	if err := json.Unmarshal([]byte(m.RecoverTriggerTasksRaw), &m.RecoverTriggerTasks); err != nil {
 		return err
 	}
+	// 重复 task ID 会让 SendTriggerTasks 重复触发同一个 cron。
+	m.FailTriggerTasks = UniqueIDs(m.FailTriggerTasks)
+	m.RecoverTriggerTasks = UniqueIDs(m.RecoverTriggerTasks)
 
 	return nil
 }

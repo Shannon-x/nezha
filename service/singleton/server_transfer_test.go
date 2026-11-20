@@ -1605,6 +1605,106 @@ func TestNewServerTransferClassPrefersNewerRollbackCredentialOverOlderVerified(t
 		"the stale H1 from an earlier Verified row must NOT be accepted after a newer rollback has been acked — the agent no longer holds it")
 }
 
+// REGRESSION (restart path): a transfer retried after its rollback was acked
+// is Pending on top of the rollback credential. Register leaves
+// verifiedHandshakes alone, so the running dashboard keeps admitting R2 and
+// keeps rejecting H1, which MarkRevertDelivered overwrote. The loader used to
+// apply the chained-Pending exception to forward credentials only: R2 failed
+// the owner gate (Server.UserID is already the Pending ToUserID), the loop
+// moved on to the next older candidate, and H1 — issued to the Pending
+// transfer's FromUserID — was installed instead. A restart therefore locked
+// the agent out and re-admitted a retired secret that the owner before t1
+// could have captured during t1's Pending window.
+//
+// Scenario reproduced here:
+//  1. Server S owned by A=100. Transfer t1 A→B, MarkVerified. Agent on disk
+//     = H1, verifiedHandshakes[S]=H1.
+//  2. Transfer t2 B→C initiated and Cancelled, MarkRevertDelivered. Agent on
+//     disk = R2, verifiedHandshakes[S]=R2.
+//  3. Transfer t3 B→C (retry) left Pending. Server.UserID=C.
+//  4. Dashboard restart.
+func TestNewServerTransferClassRebuildsAckedRollbackDuringLaterPending(t *testing.T) {
+	c, cleanup := setupTransferFixture(t)
+	defer cleanup()
+	seedServerForTransfer(t, 1, 100)
+
+	t1 := initiateAndRegister(t, c, 1, 100, 200, 1)
+	h1 := t1.HandshakeSecret
+	_, _, err := markPendingVerified(t, c, 1)
+	require.NoError(t, err)
+
+	t2 := initiateAndRegister(t, c, 1, 200, 300, 1)
+	r2 := t2.RevertHandshakeSecret
+	require.NotEmpty(t, r2)
+	_, err = c.Cancel(t2.ID)
+	require.NoError(t, err)
+	require.NoError(t, c.MarkRevertDelivered(1, t2.ID))
+
+	initiateAndRegister(t, c, 1, 200, 300, 1)
+
+	_, ok := c.LookupServerByVerifiedHandshakeSecret(r2)
+	require.True(t, ok, "precondition: R2 authenticates while the retry is Pending")
+	_, ok = c.LookupServerByVerifiedHandshakeSecret(h1)
+	require.False(t, ok, "precondition: H1 was retired by the acked rollback")
+
+	c.Stop()
+	c2 := NewServerTransferClass()
+	ServerTransferShared = c2
+	defer c2.Stop()
+
+	sid, ok := c2.LookupServerByVerifiedHandshakeSecret(r2)
+	require.True(t, ok,
+		"after restart with the retry Pending, the acked rollback credential R2 must still be rebuilt — it is what the agent has on disk until the new transfer completes")
+	require.Equal(t, uint64(1), sid)
+
+	_, h1Readmitted := c2.LookupServerByVerifiedHandshakeSecret(h1)
+	require.False(t, h1Readmitted,
+		"restart must NOT re-admit H1 — it was retired when the rollback was acked and the agent no longer holds it")
+}
+
+// REGRESSION (restart path): when the newest acked credential of a server
+// does not pass the loader's owner gate, the loader must not fall back to an
+// older one. The older credential was overwritten in verifiedHandshakes by
+// the rotation that produced the newer one; rebuilding it re-admits a secret
+// the running dashboard rejects.
+//
+// Scenario reproduced here:
+//  1. Server S owned by A=100. Transfer t1 A→B, MarkVerified (H1).
+//  2. Transfer t2 B→A, MarkVerified (H2). verifiedHandshakes[S]=H2.
+//  3. Transfer t3 A→B left Pending, then user A is deleted. OnUsersDeleted
+//     settles t3 without reverting Server.UserID, so S stays with B.
+//  4. Dashboard restart. H2 was issued to A and fails the owner gate; H1 was
+//     issued to B, the current owner, but is two rotations old.
+func TestNewServerTransferClassDoesNotFallBackToRetiredCredential(t *testing.T) {
+	c, cleanup := setupTransferFixture(t)
+	defer cleanup()
+	seedServerForTransfer(t, 1, 100)
+
+	t1 := initiateAndRegister(t, c, 1, 100, 200, 1)
+	h1 := t1.HandshakeSecret
+	_, _, err := markPendingVerified(t, c, 1)
+	require.NoError(t, err)
+
+	initiateAndRegister(t, c, 1, 200, 100, 1)
+	_, _, err = markPendingVerified(t, c, 1)
+	require.NoError(t, err)
+
+	initiateAndRegister(t, c, 1, 100, 200, 1)
+	c.OnUsersDeleted([]uint64{100})
+
+	_, ok := c.LookupServerByVerifiedHandshakeSecret(h1)
+	require.False(t, ok, "precondition: H1 was retired when t2 was verified")
+
+	c.Stop()
+	c2 := NewServerTransferClass()
+	ServerTransferShared = c2
+	defer c2.Stop()
+
+	_, h1Readmitted := c2.LookupServerByVerifiedHandshakeSecret(h1)
+	require.False(t, h1Readmitted,
+		"restart must NOT re-admit H1 — only the newest acked credential of a server may be rebuilt, an older one must never stand in for it")
+}
+
 func hasRevertDeliveryFor(c *ServerTransferClass, serverID, transferID uint64) bool {
 	t, ok := c.LookupRevertDelivery(serverID)
 	return ok && t.ID == transferID
@@ -2252,3 +2352,32 @@ func (*fakeTaskStream) Context() context.Context { return context.Background() }
 func (*cancelRaceApplyConfigStream) Context() context.Context { return context.Background() }
 
 func (*neverReturningTaskStream) Context() context.Context { return context.Background() }
+
+// SECURITY: authorizeAgentForUUID refuses the destination user's global
+// AgentSecret only when it finds the pending entry. Register must therefore
+// not make the destination user the owner while the entry is still unpublished:
+// c.mu is taken by every agent sign-in, so the destination user can hold
+// Register in exactly that state by flooding sign-ins for the server's UUID.
+func TestServerTransferRegisterPublishesPendingBeforeOwner(t *testing.T) {
+	c, cleanup := setupTransferFixture(t)
+	defer cleanup()
+	seedServerForTransfer(t, 1, 100)
+	server, ok := ServerShared.Get(1)
+	require.True(t, ok)
+	tr := &model.ServerTransfer{Common: model.Common{ID: 7}, ServerID: 1, FromUserID: 100, ToUserID: 200}
+
+	c.mu.Lock() // Register cannot publish the pending entry
+	registered := make(chan struct{})
+	go func() {
+		c.Register(tr)
+		close(registered)
+	}()
+	require.Never(t, func() bool { return server.GetUserID() == 200 }, 100*time.Millisecond, time.Millisecond,
+		"the destination user became the owner before the pending entry was published")
+	c.mu.Unlock()
+
+	<-registered
+	owner, pending := c.LookupOwnerAndPending(server)
+	require.EqualValues(t, 200, owner)
+	require.Same(t, tr, pending)
+}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/copier"
+	"github.com/robfig/cron/v3"
 	"golang.org/x/exp/constraints"
 
 	"github.com/nezhahq/nezha/model"
@@ -25,6 +26,13 @@ import (
 
 const (
 	_CurrentStatusSize = 30 // initial capacity for the rolling service window
+
+	// serviceHistoryQueueSize bounds the history rows waiting for the database.
+	serviceHistoryQueueSize = 256
+	// rejectedReportLogInterval is the minimum spacing between two "Incorrect
+	// service monitor report" log lines. The reporting agent decides how many
+	// results get rejected, so the line must not be written once per result.
+	rejectedReportLogInterval = time.Second
 )
 
 var serviceEventSequence atomic.Uint64
@@ -115,20 +123,81 @@ func (ss *ServiceSentinel) flushServiceHistory(serviceID uint64, status *service
 		return
 	}
 	if !TSDBEnabled() {
-		if err := DB.Create(&model.ServiceHistory{
+		if !ss.saveServiceHistory(&model.ServiceHistory{
 			CreatedAt: status.lastHistoryAt,
 			ServiceID: serviceID,
 			AvgDelay:  status.history.Delay,
 			Data:      status.lastData,
 			Up:        status.history.Up,
 			Down:      status.history.Down,
-		}).Error; err != nil {
-			log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
+		}) {
 			return
 		}
 	}
 	status.history = serviceResponseData{}
 	status.lastHistoryAt = now
+}
+
+// saveServiceHistory hands a history row to historyWriter without waiting for
+// the database, and reports whether the row was taken. Its callers run on the
+// one worker that processes the probe results of every user, and hold the
+// locks that report processing, the service API and server changes all need;
+// an insert waits for a connection and for SQLite's single write lock, for as
+// long as busy_timeout allows.
+func (ss *ServiceSentinel) saveServiceHistory(row *model.ServiceHistory) bool {
+	// Without a writer (a sentinel not built by NewServiceSentinel, or one
+	// whose worker has exited) the row is stored in place.
+	if ss.historyQueue == nil || ss.historyClosed.Load() {
+		if err := DB.Create(row).Error; err != nil {
+			log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
+			return false
+		}
+		return true
+	}
+	select {
+	case ss.historyQueue <- row:
+		return true
+	default:
+		// historyWriter logs the count, so a busy database is not answered
+		// with a log line per probe result.
+		ss.historyRefused.Add(1)
+		return false
+	}
+}
+
+// historyWriter stores the queued history rows. Everything that queued up
+// behind a slow insert goes into the next one, so the queue empties each time
+// the database is free.
+func (ss *ServiceSentinel) historyWriter() {
+	var rows []*model.ServiceHistory
+	for row := range ss.historyQueue {
+		rows = append(rows, row)
+		// This is the only receiver, so the rows counted here are there to take.
+		for queued := len(ss.historyQueue); queued > 0; queued-- {
+			rows = append(rows, <-ss.historyQueue)
+		}
+		rows = storeServiceHistory(rows)
+		if refused := ss.historyRefused.Swap(0); refused > 0 {
+			log.Printf("NEZHA>> Failed to save service monitor metrics: history queue was full %d times", refused)
+		}
+	}
+}
+
+// storeServiceHistory inserts the rows and returns those to insert again with
+// the next ones. As when each row was stored by the report that produced it, a
+// ping average that cannot be stored is lost, and a 15-minute summary
+// (server_id = 0) is tried again; the newest queue's worth of those is kept.
+func storeServiceHistory(rows []*model.ServiceHistory) []*model.ServiceHistory {
+	err := DB.Create(&rows).Error
+	if err == nil {
+		return nil
+	}
+	log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
+	rows = slices.DeleteFunc(rows, func(row *model.ServiceHistory) bool { return row.ServerID != 0 })
+	if excess := len(rows) - serviceHistoryQueueSize; excess > 0 {
+		rows = slices.Delete(rows, 0, excess)
+	}
+	return rows
 }
 
 func (status *serviceTaskStatus) responseData() serviceResponseData {
@@ -162,6 +231,11 @@ type pingStore struct {
 type ServiceSentinel struct {
 	// 服务监控任务上报通道
 	serviceReportChannel chan ReportData // 服务状态汇报管道
+	// historyQueue carries history rows from the worker to historyWriter. The
+	// worker closes it when it exits, after setting historyClosed.
+	historyQueue   chan *model.ServiceHistory
+	historyClosed  atomic.Bool
+	historyRefused atomic.Uint64 // times the full queue did not take a row
 	// 服务监控任务调度通道
 	dispatchBus chan<- *model.Service
 
@@ -194,12 +268,17 @@ type ServiceSentinel struct {
 	// restoring globals.
 	closeOnce sync.Once
 	workerWG  sync.WaitGroup
+
+	// Throttle state of logRejectedReport; only the worker goroutine touches it.
+	rejectedReportLoggedAt    time.Time
+	rejectedReportsSuppressed uint64
 }
 
 // NewServiceSentinel 创建服务监控器
 func NewServiceSentinel(serviceSentinelDispatchBus chan<- *model.Service) (*ServiceSentinel, error) {
 	ss := &ServiceSentinel{
 		serviceReportChannel:     make(chan ReportData, 200),
+		historyQueue:             make(chan *model.ServiceHistory, serviceHistoryQueueSize),
 		serviceStatusToday:       make(map[uint64]*_TodayStatsOfService),
 		serviceCurrentStatusData: make(map[uint64]*serviceTaskStatus),
 		serviceResponseDataStore: make(map[uint64]serviceResponseData),
@@ -222,10 +301,17 @@ func NewServiceSentinel(serviceSentinelDispatchBus chan<- *model.Service) (*Serv
 	ss.loadTodayStats(today)
 
 	// 启动服务监控器
-	ss.workerWG.Add(1)
+	ss.workerWG.Add(2)
 	go func() {
 		defer ss.workerWG.Done()
 		ss.worker()
+		ss.historyClosed.Store(true)
+		close(ss.historyQueue)
+	}()
+	// 历史记录由独立协程写入数据库，worker 不等待数据库
+	go func() {
+		defer ss.workerWG.Done()
+		ss.historyWriter()
 	}()
 
 	// 每日将游标往后推一天
@@ -316,6 +402,16 @@ func (ss *ServiceSentinel) loadServiceHistory() error {
 		}
 		if service.Duration > model.MaxServiceDuration {
 			log.Printf("NEZHA>> quarantining service %d: duration exceeds 30 days", service.ID)
+			continue
+		}
+		if err := model.ValidateServiceLatency(service.MinLatency, service.MaxLatency); err != nil {
+			// A row stored before thresholds were validated would make the whole
+			// service list unparsable for its owner and for every admin.
+			log.Printf("NEZHA>> quarantining service %d: %v", service.ID, err)
+			continue
+		}
+		if err := model.ValidateServiceTarget(service.Target); err != nil {
+			log.Printf("NEZHA>> quarantining service %d: %v", service.ID, err)
 			continue
 		}
 		task := service
@@ -476,6 +572,9 @@ func (ss *ServiceSentinel) Update(m *model.Service) error {
 	if err := model.ValidateServiceMonitorType(uint64(m.Type)); err != nil {
 		return err
 	}
+	if err := model.ValidateServiceTarget(m.Target); err != nil {
+		return err
+	}
 
 	ss.serviceResponseDataStoreLock.Lock()
 	defer ss.serviceResponseDataStoreLock.Unlock()
@@ -520,6 +619,16 @@ func (ss *ServiceSentinel) Update(m *model.Service) error {
 }
 
 func (ss *ServiceSentinel) Delete(ids []uint64) {
+	// Runs after the locks below are released: every Remove makes the
+	// scheduler copy and sort all of its entries, and every probe result
+	// waits for these locks.
+	var jobs []cron.EntryID
+	defer func() {
+		for _, job := range jobs {
+			CronShared.Remove(job)
+		}
+	}()
+
 	ss.serviceResponseDataStoreLock.Lock()
 	defer ss.serviceResponseDataStoreLock.Unlock()
 	ss.monthlyStatusLock.Lock()
@@ -544,7 +653,7 @@ func (ss *ServiceSentinel) Delete(ids []uint64) {
 		// ids are cleaned from memory — their service records were already deleted
 		// from the database, producing zombie services.
 		if svc := ss.services[id]; svc != nil {
-			CronShared.Remove(svc.CronJobID)
+			jobs = append(jobs, svc.CronJobID)
 		}
 		delete(ss.services, id)
 
@@ -656,11 +765,23 @@ func canReportServiceResult(service *model.Service, reporter *model.Server, task
 		return false
 	}
 
-	return service.UserID == reporter.GetUserID() || userIsAdmin(service.UserID)
+	return serverTaskResultAdmitted(reporter, service.UserID)
+}
+
+// serviceTrustsReporter reports whether an accepted result may move the state
+// the service shares between its reporters: availability, alerts, trigger
+// tasks and the TLS baseline. An admin-owned service is dispatched to covered
+// servers of every user and canReportServiceResult accepts their results, but
+// a member can enrol any number of servers, so only servers of the service
+// owner or of an admin are witnesses.
+func serviceTrustsReporter(service *model.Service, reporter *model.Server) bool {
+	reporterOwner := reporter.GetUserID()
+	return reporterOwner == service.UserID || userIsAdmin(reporterOwner)
 }
 
 // Close shuts down the ServiceSentinel worker goroutine and waits for it to
-// exit. It is idempotent and safe to call more than once.
+// exit, and for the history rows it queued to be stored. It is idempotent and
+// safe to call more than once.
 //
 // Why this exists: the worker reads multiple package-level globals during
 // each report (Conf, CronShared via notifyCheck, NotificationShared via
@@ -699,6 +820,26 @@ func (ss *ServiceSentinel) worker() {
 	}
 }
 
+// logRejectedReport records a result that failed canReportServiceResult.
+//
+// Both the size and the number of rejected results are chosen by the reporting
+// agent, so the line carries identifiers only — never the result itself, whose
+// data field can be megabytes and is escaped to several times that by %v — and
+// is written at most once per rejectedReportLogInterval. Formatting happens on
+// the single worker goroutine: a slow line here stalls every tenant's results
+// and lets the report channel back up.
+func (ss *ServiceSentinel) logRejectedReport(r ReportData) {
+	now := time.Now()
+	if now.Sub(ss.rejectedReportLoggedAt) < rejectedReportLogInterval {
+		ss.rejectedReportsSuppressed++
+		return
+	}
+	log.Printf("NEZHA>> Incorrect service monitor report: serviceID=%d type=%d reporterID=%d suppressedSinceLast=%d",
+		r.Data.GetId(), r.Data.GetType(), r.Reporter, ss.rejectedReportsSuppressed)
+	ss.rejectedReportLoggedAt = now
+	ss.rejectedReportsSuppressed = 0
+}
+
 func (ss *ServiceSentinel) processReport(r ReportData, serverShared *ServerClass) {
 	serverShared.lockLifecycleRead()
 	defer serverShared.unlockLifecycleRead()
@@ -707,7 +848,7 @@ func (ss *ServiceSentinel) processReport(r ReportData, serverShared *ServerClass
 	reporter, _ := serverShared.Get(r.Reporter)
 	// 入站结果必须匹配出站任务派发边界，避免 agent 伪造其他服务 ID 写入监控状态。
 	if !canReportServiceResult(cs, reporter, r.Data.GetType()) {
-		log.Printf("NEZHA>> Incorrect service monitor report %+v", r)
+		ss.logRejectedReport(r)
 		return
 	}
 	if ss.serviceReportValidatedHook != nil {
@@ -756,14 +897,13 @@ func (ss *ServiceSentinel) processReport(r ReportData, serverShared *ServerClass
 					log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
 				}
 			} else {
-				if err := DB.Create(&model.ServiceHistory{
+				ss.saveServiceHistory(&model.ServiceHistory{
+					CreatedAt: time.Now(), // the row is stored later
 					ServiceID: mh.GetId(),
 					AvgDelay:  ts.ping,
 					Data:      mh.Data,
 					ServerID:  r.Reporter,
-				}).Error; err != nil {
-					log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
-				}
+				})
 			}
 			ts.count = 0
 			ts.ping = 0
@@ -782,6 +922,12 @@ func (ss *ServiceSentinel) processReport(r ReportData, serverShared *ServerClass
 				log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
 			}
 		}
+	}
+
+	// A covered server of another user keeps the per-server history written
+	// above, but must not decide the service's shared state.
+	if !serviceTrustsReporter(cs, reporter) {
+		return
 	}
 
 	// 写入当天状态
@@ -859,7 +1005,9 @@ func (ss *ServiceSentinel) processReport(r ReportData, serverShared *ServerClass
 			// 清除网络错误静音缓存
 			NotificationShared.UnMuteNotification(cs.NotificationGroupID, NotificationMuteLabel.ServiceTLS(mh.GetId(), "network"))
 
-			var newCert = strings.Split(mh.Data, "|")
+			// 证书资料来自 Agent，只读取 "签发者|过期时间" 两个字段；
+			// 限制切分数量，避免为超长文本中的每个分隔符分配字段。
+			var newCert = strings.SplitN(mh.Data, "|", 3)
 			if len(newCert) > 1 {
 				enableNotify := cs.Notify
 				expiresNew, newErr := time.Parse("2006-01-02 15:04:05 -0700 MST", newCert[1])
@@ -873,7 +1021,7 @@ func (ss *ServiceSentinel) processReport(r ReportData, serverShared *ServerClass
 					ss.tlsCertCache[mh.GetId()] = mh.Data
 				}
 
-				oldCert := strings.Split(ss.tlsCertCache[mh.GetId()], "|")
+				oldCert := strings.SplitN(ss.tlsCertCache[mh.GetId()], "|", 3)
 				isCertChanged := false
 				expiresOld, oldErr := time.Parse("2006-01-02 15:04:05 -0700 MST", oldCert[1])
 				if oldErr != nil {

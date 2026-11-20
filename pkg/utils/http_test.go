@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
@@ -21,6 +22,17 @@ func TestHTTPURLTargetIPAllowed(t *testing.T) {
 		{name: "local-use NAT64", address: "64:ff9b:1::a9fe:a9fe", allowed: false},
 		{name: "6to4 public IPv4 embedding", address: "2002:0101:0101::1", allowed: false},
 		{name: "6to4 link-local IPv4 embedding", address: "2002:a9fe:a9fe::1", allowed: false},
+		{name: "site-local", address: "fec0::2", allowed: false},
+		{name: "site-local upper bound", address: "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", allowed: false},
+		{name: "IPv4-compatible loopback embedding", address: "::127.0.0.1", allowed: false},
+		{name: "IPv4-compatible link-local embedding", address: "::169.254.169.254", allowed: false},
+		{name: "IPv4-translated link-local embedding", address: "::ffff:0:169.254.169.254", allowed: false},
+		{name: "documentation", address: "3fff::1", allowed: false},
+		{name: "unassigned below global unicast", address: "200::1", allowed: false},
+		{name: "unassigned above global unicast", address: "4000::1", allowed: false},
+		{name: "SRv6 SIDs", address: "5f00::1", allowed: false},
+		{name: "global unicast lower bound", address: "2000::1", allowed: true},
+		{name: "global unicast upper bound", address: "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", allowed: true},
 	}
 
 	for _, test := range tests {
@@ -40,6 +52,9 @@ func TestResolveAllowedHTTPURLRejectsSpecialIPv6Literals(t *testing.T) {
 	for _, rawURL := range []string{
 		"http://[64:ff9b:1::a9fe:a9fe]/metadata",
 		"http://[2002:a9fe:a9fe::1]/metadata",
+		"http://[fec0::2]/metadata",
+		"http://[::169.254.169.254]/metadata",
+		"http://[::ffff:0:169.254.169.254]/metadata",
 	} {
 		t.Run(rawURL, func(t *testing.T) {
 			_, _, err := ResolveAllowedHTTPURL(rawURL)
@@ -89,6 +104,45 @@ func TestBuildRestrictedHTTPClientHonorsSkipVerifyTLS(t *testing.T) {
 	transport := client.Transport.(*http.Transport)
 	if !transport.TLSClientConfig.InsecureSkipVerify {
 		t.Fatalf("expected InsecureSkipVerify=true when skipVerifyTLS=true")
+	}
+}
+
+// Client.Timeout does not end a TLS handshake that net/http has detached from
+// the request, so the transport itself has to bound it.
+func TestBuildRestrictedHTTPClientBoundsTLSHandshake(t *testing.T) {
+	parsed, _ := url.Parse("https://example.com/webhook")
+	client := buildRestrictedHTTPClient(parsed, net.ParseIP("1.1.1.1"), false)
+	transport := client.Transport.(*http.Transport)
+	if got := transport.TLSHandshakeTimeout; got <= 0 || got >= client.Timeout {
+		t.Fatalf("expected a TLS handshake timeout below the client timeout %v, got %v", client.Timeout, got)
+	}
+}
+
+// The client is built for a single request and then dropped, so nothing would
+// ever reuse or close a connection it left in the idle pool.
+func TestBuildRestrictedHTTPClientClosesConnectionAfterResponse(t *testing.T) {
+	closed := make(chan struct{}, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			closed <- struct{}{}
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	parsed, _ := url.Parse(server.URL)
+	client := buildRestrictedHTTPClient(parsed, net.ParseIP("127.0.0.1"), false)
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected the connection to be closed once the response was consumed")
 	}
 }
 

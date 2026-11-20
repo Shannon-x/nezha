@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +25,9 @@ func distributionZIP(t *testing.T, names ...string) []byte {
 		entry, err := writer.Create(name)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if strings.HasSuffix(name, "/") {
+			continue
 		}
 		if _, err := io.WriteString(entry, "<html>installed frontend</html>"); err != nil {
 			t.Fatal(err)
@@ -89,6 +94,44 @@ func TestReleaseListFiltersDistributionAndPreservesPagination(t *testing.T) {
 	}
 	if len(page.Releases) != 1 || page.Releases[0].Tag != "v1.0.0" || !page.HasMore || page.Page != 2 {
 		t.Fatalf("wrong filtered page: %+v", page)
+	}
+}
+
+func TestReleaseResponsesBoundListLengths(t *testing.T) {
+	serve := func(body string) *Client {
+		return &Client{open: func(context.Context, string) (*http.Response, error) {
+			return &http.Response{Body: io.NopCloser(strings.NewReader(body))}, nil
+		}}
+	}
+	const repository = "https://github.com/owner/site"
+	asset := `{"name":"dist.zip","browser_download_url":"https://cdn.example/dist.zip"}`
+	tooManyAssets := `{"tag_name":"v1","assets":[` + strings.Repeat(asset+",", maxReleaseAssets) + asset + `]}`
+	for name, body := range map[string]string{
+		"too many releases":   "[" + strings.Repeat("{},", maxReleasesPerPage) + "{}]",
+		"entries of any type": "[" + strings.Repeat("0,", 1<<20) + "0]",
+		"too many assets":     "[" + tooManyAssets + "]",
+		"not a list":          `{"tag_name":"v1"}`,
+	} {
+		if _, err := serve(body).Releases(context.Background(), repository, 1); err == nil {
+			t.Errorf("accepted a release list with %s", name)
+		}
+	}
+	if _, err := serve(tooManyAssets).release(context.Background(), repository, "v1"); err == nil {
+		t.Error("accepted a release with too many assets")
+	}
+
+	// Servers that ignore per_page, null lists and releases without assets still work.
+	body := "[" + strings.Repeat(`{"tag_name":"v0","assets":null},`, maxReleasesPerPage-1) + `{"tag_name":"v1","assets":[` + asset + `]}]`
+	page, err := serve(body).Releases(context.Background(), repository, 1)
+	if err != nil || len(page.Releases) != 1 || page.Releases[0].Tag != "v1" || len(page.Releases[0].Assets) != 1 {
+		t.Fatalf("rejected a full page: %+v, %v", page, err)
+	}
+	if page, err = serve("null").Releases(context.Background(), repository, 1); err != nil || len(page.Releases) != 0 {
+		t.Fatalf("rejected an empty list: %+v, %v", page, err)
+	}
+	release, err := serve(`{"tag_name":"v1","assets":[`+strings.Repeat(asset+",", maxReleaseAssets-1)+asset+`]}`).release(context.Background(), repository, "v1")
+	if err != nil || len(release.Assets) != maxReleaseAssets {
+		t.Fatalf("rejected a release with %d assets: %v", maxReleaseAssets, err)
 	}
 }
 
@@ -192,6 +235,27 @@ func TestDistributionRejectsSymlinks(t *testing.T) {
 	}
 }
 
+func TestDistributionBoundsCentralDirectoryBeforeListingIt(t *testing.T) {
+	// archive/zip lists every record it finds, whatever count the archive states,
+	// so the entry limit must not be the first thing that stops this archive.
+	record := make([]byte, 46)
+	copy(record, "PK\x01\x02")
+	count := int(maxArchiveDirectory)/len(record) + 1
+	end := make([]byte, 22)
+	copy(end, "PK\x05\x06")
+	binary.LittleEndian.PutUint16(end[8:], uint16(count))
+	binary.LittleEndian.PutUint16(end[10:], uint16(count))
+	binary.LittleEndian.PutUint32(end[12:], uint32(count*len(record)))
+	store, _ := installationStore(t, append(bytes.Repeat(record, count), end...), "")
+	_, err := store.Install(context.Background(), "https://github.com/owner/site", "v1.0.0", false)
+	if !errors.Is(err, errArchiveDirectory) {
+		t.Fatalf("archive with %d entries was listed: %v", count, err)
+	}
+	if len(store.Templates()) != 1 {
+		t.Fatal("oversized archive became selectable")
+	}
+}
+
 func TestDistributionCannotWriteThroughExistingEscapingSymlink(t *testing.T) {
 	destination := t.TempDir()
 	outside := t.TempDir()
@@ -281,5 +345,37 @@ func TestRemoveFilesystemFailurePreservesCatalog(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(saved, template.Path, "dist", "index.html")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDistributionLimitsCreatedDirectories(t *testing.T) {
+	siblings := []string{"dist/index.html"}
+	for i := 1; i < maxArchiveFiles; i++ {
+		siblings = append(siblings, fmt.Sprintf("dist/%d/site.js", i))
+	}
+	for _, test := range []struct {
+		names []string
+		want  string
+	}{
+		{siblings, "too many files"},
+		{[]string{"dist/index.html", "dist/" + strings.Repeat("a/", maxArchiveFiles)}, "nested too deeply"},
+		{[]string{"dist/index.html", "dist/" + strings.Repeat("a/", maxArchiveDepth-1) + "site.js"}, "nested too deeply"},
+		{[]string{"dist/index.html", "dist/" + strings.Repeat("a/", maxArchiveDepth-2) + "site.js"}, ""},
+	} {
+		store, _ := installationStore(t, distributionZIP(t, test.names...), "")
+		_, err := store.Install(context.Background(), "https://github.com/owner/site", "v1.0.0", false)
+		if test.want == "" {
+			if err != nil {
+				t.Fatalf("archive within the limits refused: %v", err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Fatalf("archive with %d entries ending in %.20s accepted: %v", len(test.names), test.names[len(test.names)-1], err)
+		}
+		entries, err := os.ReadDir(store.root)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("failed installation left files: %v %v", entries, err)
+		}
 	}
 }

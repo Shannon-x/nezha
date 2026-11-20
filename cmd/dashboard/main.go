@@ -22,6 +22,7 @@ import (
 	"github.com/nezhahq/nezha/cmd/dashboard/controller/waf"
 	"github.com/nezhahq/nezha/cmd/dashboard/rpc"
 	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/grpcx"
 	"github.com/nezhahq/nezha/pkg/idcodec"
 	"github.com/nezhahq/nezha/pkg/utils"
 	"github.com/nezhahq/nezha/proto"
@@ -115,6 +116,12 @@ func initSystem(bus chan<- *model.Service) error {
 	if _, err := singleton.CronShared.AddFunc("0 30 4 * * *", singleton.PruneOnlineSessions); err != nil {
 		return err
 	}
+
+	// WAF 记录保留清理：封禁到期后删除，否则每个来源地址的失败记录会永久保留
+	if _, err := singleton.CronShared.AddFunc("@every 1h", singleton.PruneExpiredWAFBlocks); err != nil {
+		return err
+	}
+	singleton.PruneExpiredWAFBlocks()
 
 	if err := singleton.StartJWTSessionGC(); err != nil {
 		return err
@@ -221,6 +228,8 @@ func main() {
 	if singleton.Conf.HTTPS.ListenPort != 0 {
 		muxServerHTTPS = &http.Server{
 			ReadHeaderTimeout: dashboardReadHeaderTimeout,
+			MaxHeaderBytes:    dashboardMaxHeaderBytes,
+			HTTP2:             &http.HTTP2Config{WriteByteTimeout: dashboardHTTP2WriteByteTimeout, MaxReadFrameSize: dashboardHTTP2MaxReadFrameSize},
 			Addr:              fmt.Sprintf("%s:%d", singleton.Conf.ListenHost, singleton.Conf.HTTPS.ListenPort),
 			Handler:           muxHandler,
 			TLSConfig: &tls.Config{
@@ -292,7 +301,7 @@ func newHTTPandGRPCMux(httpHandler http.Handler, grpcHandler http.Handler) http.
 		}
 		if r.ProtoMajor == 2 && r.Header.Get("Content-Type") == "application/grpc" &&
 			strings.HasPrefix(r.URL.Path, "/"+proto.NezhaService_ServiceDesc.ServiceName) {
-			grpcHandler.ServeHTTP(w, r)
+			grpcx.ServeAbortable(grpcHandler, w, r)
 			return
 		}
 		httpHandler.ServeHTTP(w, r)

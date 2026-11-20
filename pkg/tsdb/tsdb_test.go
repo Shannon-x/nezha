@@ -1,6 +1,8 @@
 package tsdb
 
 import (
+	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -437,6 +439,59 @@ func TestDownsample(t *testing.T) {
 	}
 }
 
+func TestDownsampleMetrics_Average(t *testing.T) {
+	points := []rawDataPoint{
+		{timestamp: 0, value: 10},
+		{timestamp: 1000, value: 20},
+		{timestamp: 2000, value: 60},
+		{timestamp: 60000, value: 12.5},
+		{timestamp: 61000, value: 12.5},
+		{timestamp: 62000, value: 12.5},
+	}
+
+	result := downsampleMetrics(points, time.Minute, false)
+
+	require.Len(t, result, 2)
+	assert.Equal(t, int64(0), result[0].Timestamp)
+	assert.Equal(t, float64(30), result[0].Value)
+	assert.Equal(t, int64(60000), result[1].Timestamp)
+	assert.Equal(t, 12.5, result[1].Value)
+
+	// 累积型指标取桶内最后一个值
+	result = downsampleMetrics(points, time.Minute, true)
+
+	require.Len(t, result, 2)
+	assert.Equal(t, float64(60), result[0].Value)
+	assert.Equal(t, 12.5, result[1].Value)
+}
+
+// Finite agent-supplied samples must not average to Inf: JSON cannot encode
+// it and the whole metrics response would be lost.
+func TestDownsampleMetrics_HugeSamplesStayFinite(t *testing.T) {
+	for _, samples := range [][]float64{
+		{1.7e308, 1.7e308, 1.7e308},
+		{math.MaxFloat64, math.MaxFloat64, math.MaxFloat64, math.MaxFloat64},
+		{math.MaxFloat64, -math.MaxFloat64, math.MaxFloat64},
+		{-math.MaxFloat64, -math.MaxFloat64},
+		{math.MaxFloat64, math.Nextafter(math.MaxFloat64, 0), math.MaxFloat64},
+	} {
+		points := make([]rawDataPoint, len(samples))
+		lo, hi := samples[0], samples[0]
+		for i, value := range samples {
+			points[i] = rawDataPoint{timestamp: int64(i), value: value}
+			lo, hi = math.Min(lo, value), math.Max(hi, value)
+		}
+
+		result := downsampleMetrics(points, time.Minute, false)
+
+		require.Len(t, result, 1)
+		assert.GreaterOrEqual(t, result[0].Value, lo, "samples %v", samples)
+		assert.LessOrEqual(t, result[0].Value, hi, "samples %v", samples)
+		_, err := json.Marshal(result)
+		require.NoError(t, err, "samples %v", samples)
+	}
+}
+
 func TestCalculateStats(t *testing.T) {
 	points := []rawDataPoint{
 		{timestamp: 1000, value: 10, status: 1, hasDelay: true, hasStatus: true},
@@ -619,4 +674,84 @@ func TestTSDB_QueryServiceHistoryByServerID_ClosedDB(t *testing.T) {
 
 	_, err = db.QueryServiceHistoryByServerID(1, Period1Day)
 	assert.Error(t, err)
+}
+
+// Releases before v2.6.0 wrote agent-reported ±Inf to the store unchecked.
+// Every query must still return values that a JSON response can carry.
+func TestTSDB_QueriesSanitizeStoredNonFiniteSamples(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "tsdb_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	config := &Config{
+		DataPath:           filepath.Join(tempDir, "tsdb"),
+		RetentionDays:      30,
+		MinFreeDiskSpaceGB: 1,
+		DedupInterval:      time.Second,
+	}
+
+	db, err := Open(config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	now := time.Now()
+	serviceID := uint64(100)
+	serverID := uint64(1)
+
+	for _, age := range []time.Duration{time.Minute, 72 * time.Hour} {
+		for _, delay := range []float64{math.Inf(1), math.Inf(-1)} {
+			require.NoError(t, db.WriteServiceMetrics(&ServiceMetrics{
+				ServiceID:  serviceID,
+				ServerID:   serverID,
+				Timestamp:  now.Add(-age),
+				Delay:      delay,
+				Successful: true,
+			}))
+			age += time.Minute
+		}
+	}
+	require.NoError(t, db.WriteServerMetrics(&ServerMetrics{
+		ServerID:  serverID,
+		Timestamp: now.Add(-time.Minute),
+		CPU:       math.Inf(1),
+	}))
+
+	db.Flush()
+
+	byService, err := db.QueryServiceHistory(serviceID, Period1Day)
+	require.NoError(t, err)
+	require.Len(t, byService.Servers, 1)
+	assert.Equal(t, uint64(2), byService.Servers[0].Stats.TotalUp, "status samples are kept")
+	assert.Equal(t, float64(0), byService.Servers[0].Stats.AvgDelay)
+
+	byServer, err := db.QueryServiceHistoryByServerID(serverID, Period1Day)
+	require.NoError(t, err)
+	require.Contains(t, byServer, serviceID)
+	assert.Equal(t, float64(0), byServer[serviceID].Servers[0].Stats.AvgDelay)
+
+	year, month, day := now.Date()
+	today := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+	daily, err := db.QueryServiceDailyStats(serviceID, today, 30)
+	require.NoError(t, err)
+	var dailyUp uint64
+	for _, stats := range daily {
+		dailyUp += stats.Up
+		assert.Equal(t, float64(0), stats.Delay)
+	}
+	assert.GreaterOrEqual(t, dailyUp, uint64(2))
+
+	cpu, err := db.QueryServerMetrics(serverID, MetricServerCPU, Period1Day)
+	require.NoError(t, err)
+	require.Len(t, cpu, 1)
+	assert.Equal(t, float64(0), cpu[0].Value)
+
+	for name, value := range map[string]any{
+		"service history": byService,
+		"server services": byServer,
+		"daily stats":     daily,
+		"server metrics":  cpu,
+	} {
+		_, err := json.Marshal(value)
+		assert.NoError(t, err, name)
+	}
 }

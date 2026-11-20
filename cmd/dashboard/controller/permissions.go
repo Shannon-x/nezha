@@ -279,20 +279,31 @@ const coverModeUnknown coverMode = 255
 
 // patGroupMembershipAccessAllowed returns false when the caller's PAT
 // carries a server_ids whitelist that does not cover every current member
-// of groupID. JWT requests and unscoped PATs always pass. Used by
-// updateServerGroup before the transactional DELETE+INSERT — otherwise a
-// PAT scoped to [X] could indirectly remove server Y from a shared group.
-func patGroupMembershipAccessAllowed(c *gin.Context, groupID uint64) bool {
+// of every group in groupIDs, or when one of those groups has no member at
+// all: the whitelist reaches a group only through its servers, so an empty
+// group is outside it (listServerGroup hides it from such a PAT for the
+// same reason) and must not pass vacuously. JWT requests and unscoped PATs
+// always pass. Used by updateServerGroup before the transactional
+// DELETE+INSERT — otherwise a PAT scoped to [X] could indirectly remove
+// server Y from a shared group — and by batchDeleteServerGroup.
+func patGroupMembershipAccessAllowed(c *gin.Context, groupIDs ...uint64) bool {
 	tok := patAccessorFromContext(c)
 	if tok == nil || !patHasServerWhitelist(c) {
 		return true
 	}
 	var members []model.ServerGroupServer
-	if err := singleton.DB.Where("server_group_id = ?", groupID).Find(&members).Error; err != nil {
+	if err := singleton.DB.Where("server_group_id in (?)", groupIDs).Find(&members).Error; err != nil {
 		return false
 	}
+	populated := make(map[uint64]struct{}, len(groupIDs))
 	for _, m := range members {
 		if !tok.CanAccessServer(m.ServerId) {
+			return false
+		}
+		populated[m.ServerGroupId] = struct{}{}
+	}
+	for _, id := range groupIDs {
+		if _, ok := populated[id]; !ok {
 			return false
 		}
 	}
@@ -467,6 +478,23 @@ func enforcePATTriggerTaskScope(c *gin.Context, failTasks, recoverTasks []uint64
 	return nil
 }
 
+// callerIsNATDomainAdmin reports whether the request may use the administrator
+// exemption of the NAT domain policy (any hostname that is not reserved). A PAT
+// carries its owner's role, so an administrator's token limited to
+// nezha:nat:write would otherwise be free to claim every hostname the panel is
+// reached under but never declared, and newHTTPandGRPCMux would then tunnel
+// that traffic, logins included, to a backend of the token holder's choosing.
+// Only JWT sessions and PATs that also carry nezha:admin:* keep the exemption;
+// every other PAT is held to nat_member_domains like a member. The runtime
+// checks only know the profile owner, so this must be enforced at write time.
+func callerIsNATDomainAdmin(c *gin.Context) bool {
+	if !callerIsAdmin(c) {
+		return false
+	}
+	tok := APITokenFromContext(c)
+	return tok == nil || tok.HasScope(model.ScopeAdminAll)
+}
+
 func userCanViewServer(c *gin.Context, server *model.Server) bool {
 	if server == nil {
 		return false
@@ -492,6 +520,12 @@ func userCanViewService(c *gin.Context, service *model.Service) bool {
 	if service == nil {
 		return false
 	}
+	// PAT 白名单优先，与 userCanViewServer 对称：server_ids 受限 PAT 只能看见
+	// fan-out 完全落在白名单内的 service，与 HideForGuest 无关。否则公开 service
+	// 的聚合状态/历史会把白名单外 server 的探测结果泄漏给受限 PAT。
+	if enforcePATServiceDispatchScope(c, service) != nil {
+		return false
+	}
 	// HideForGuest 默认公开，置 true 才对 guest 隐藏，语义与 Server.HideForGuest 对齐。
 	if service.HideForGuest {
 		if _, isMember := c.Get(model.CtxKeyAuthorizedUser); !isMember {
@@ -504,9 +538,20 @@ func userCanViewService(c *gin.Context, service *model.Service) bool {
 	return true
 }
 
+// assertOwnsNotificationGroup 是 service / alertrule / cron 写侧引用通知组的
+// 唯一校验入口。与 enforcePATTriggerTaskScope 同理：运行时 sentinel / cron 通过
+// 已落库的 notification_group_id 发通知时没有 PAT 上下文，HasPermission 也只
+// 校验 ownership 而非 scope，所以必须在写侧对 PAT 额外要求
+// ScopeNotificationGroupRead，否则仅有 service:write 的 PAT 就能借签发者的通知
+// 渠道发送任意文本。scope 校验放在查库之前，避免无 scope 的 PAT 借报错差异
+// 枚举通知组 ID。
 func assertOwnsNotificationGroup(c *gin.Context, groupID uint64) error {
 	if groupID == 0 {
 		return nil
+	}
+
+	if tok := APITokenFromContext(c); tok != nil && !tok.HasScope(model.ScopeNotificationGroupRead) {
+		return singleton.Localizer.ErrorT("permission denied")
 	}
 
 	var ng model.NotificationGroup

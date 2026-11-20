@@ -24,6 +24,16 @@ var NezhaHandlerSingleton *NezhaHandler
 // after its stream is no longer the live stream for the authenticated server.
 var ErrRequestTaskStreamSuperseded = errors.New("request task stream superseded")
 
+// maxConfigReportBytes bounds the Agent-chosen text answering
+// TaskTypeReportConfig. GET /server/config/:id returns it as it came, JSON
+// escaping can grow it sixfold, and the response stays in memory until the
+// client has read it. An Agent configuration is a few hundred bytes.
+const maxConfigReportBytes = 64 * 1024
+
+// ErrConfigReportTooLarge is handed to the waiting config reader in place of
+// a report, or a failure reason, longer than maxConfigReportBytes.
+var ErrConfigReportTooLarge = errors.New("agent config report too large")
+
 type NezhaHandler struct {
 	Auth                   *authHandler
 	ioStreams              map[string]*ioStreamContext
@@ -31,6 +41,8 @@ type NezhaHandler struct {
 	ioStreamGeneration     uint64
 	ioStreamNotify         chan struct{}
 	ioStreamWaitLockedHook func()
+	// ioStreamAborts resets the agent RPCs of the most recently closed streams (endClosedIOStream).
+	ioStreamAborts chan func()
 	// Capability authorization and exact stream deletion share ioStreamMutex to avoid TOCTOU.
 	agentCompatCapabilities agentCompatCapabilityState
 }
@@ -55,6 +67,7 @@ func NewNezhaHandler() *NezhaHandler {
 		ioStreamMutex:  new(sync.RWMutex),
 		ioStreams:      make(map[string]*ioStreamContext),
 		ioStreamNotify: make(chan struct{}),
+		ioStreamAborts: make(chan func(), maxClosingStreams),
 	}
 	handler.initializeAgentCompatCapabilities()
 	return handler
@@ -144,6 +157,9 @@ func (s *NezhaHandler) RequestTask(stream pb.NezhaService_RequestTaskServer) err
 		}
 	}()
 	var result *pb.TaskResult
+	// The agent decides how many unmatched ServerTransferApply results it sends;
+	// log at most one of them per second on this stream.
+	var transferResultIgnoredLoggedAt time.Time
 	for {
 		select {
 		case <-failed:
@@ -192,6 +208,10 @@ func (s *NezhaHandler) RequestTask(stream pb.NezhaService_RequestTaskServer) err
 			}
 		case model.TaskTypeReportConfig:
 			if len(server.ConfigCache) < 1 {
+				if len(result.GetData()) > maxConfigReportBytes {
+					server.ConfigCache <- ErrConfigReportTooLarge
+					continue
+				}
 				if !result.GetSuccessful() {
 					server.ConfigCache <- errors.New(result.Data)
 					continue
@@ -210,7 +230,10 @@ func (s *NezhaHandler) RequestTask(stream pb.NezhaService_RequestTaskServer) err
 			}
 			pending, ok := singleton.ServerTransferShared.LookupPending(clientID)
 			if !ok || pending.ID != result.GetId() {
-				log.Printf("NEZHA>> ServerTransferApply result ignored: clientID=%d reported transferID=%d but no matching pending transfer", clientID, result.GetId())
+				if now := time.Now(); now.Sub(transferResultIgnoredLoggedAt) >= time.Second {
+					transferResultIgnoredLoggedAt = now
+					log.Printf("NEZHA>> ServerTransferApply result ignored: clientID=%d reported transferID=%d but no matching pending transfer", clientID, result.GetId())
+				}
 				continue
 			}
 			if result.GetSuccessful() {

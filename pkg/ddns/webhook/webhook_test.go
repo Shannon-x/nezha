@@ -2,8 +2,13 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
+	"maps"
+	"net/netip"
 	"strings"
 	"testing"
+
+	"github.com/libdns/libdns"
 
 	"github.com/nezhahq/nezha/model"
 )
@@ -168,5 +173,104 @@ func TestWebhookTargetRejectsBlockedRanges(t *testing.T) {
 				t.Fatalf("expected not allowed error, got %q", err.Error())
 			}
 		})
+	}
+}
+
+// The DDNS worker logs the error SetRecords returns, so it must not carry the
+// webhook URL: the URL holds tokens and the expanded #access_secret#.
+func TestSetRecordsErrorOmitsWebhookURL(t *testing.T) {
+	recs := []libdns.Record{libdns.Address{Name: "home", IP: netip.MustParseAddr("6.6.6.6")}}
+	secrets := []string{"stored-id", "stored-secret", "embedded-token", "pa55"}
+
+	// A cancelled context makes client.Do fail before anything is dialled.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cases := []struct {
+		name   string
+		url    string
+		expect string
+	}{
+		{"request fails",
+			"http://1.1.1.1/embedded-token/update?token=embedded-token&id=#access_id#&password=#access_secret#",
+			"Get: " + context.Canceled.Error()},
+		{"invalid escape",
+			"http://1.1.1.1/embedded-token%zz/update", errInvalidURL.Error()},
+		{"unescaped password",
+			"http://user:pa55/word@1.1.1.1/update", errInvalidURL.Error()},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			provider := &Provider{DDNSProfile: &model.DDNSProfile{
+				AccessID:      "stored-id",
+				AccessSecret:  "stored-secret",
+				WebhookURL:    c.url,
+				WebhookMethod: methodGET,
+			}}
+			_, err := provider.SetRecords(ctx, "example.com.", recs)
+			if err == nil {
+				t.Fatal("expected SetRecords to fail")
+			}
+			for _, secret := range secrets {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error discloses %q: %v", secret, err)
+				}
+			}
+			if !strings.HasSuffix(err.Error(), "Cause by: "+c.expect) {
+				t.Fatalf("expected cause %q, got: %v", c.expect, err)
+			}
+		})
+	}
+}
+
+// Placeholder values are not written by the author of the template (#domain#
+// may be a server's DDNS domain override), so they must stay inside the JSON
+// string or the header value the template puts them in.
+func TestWebhookPlaceholderValuesStayInTheirField(t *testing.T) {
+	domain := `www.example.com","ip":"6.6.6.6","Authorization":"Bearer other","x":"y.example.com`
+	provider := &Provider{
+		ipAddr:     "1.1.1.1",
+		ipType:     "ipv4",
+		recordType: "A",
+		domain:     domain,
+		DDNSProfile: &model.DDNSProfile{
+			AccessSecret:       `stored"secret\`,
+			WebhookURL:         "http://1.1.1.1/api?domain=#domain#",
+			WebhookMethod:      methodPOST,
+			WebhookRequestType: requestTypeJSON,
+			WebhookRequestBody: "{\r\n\"ip\":\"#ip#\",\r\n\"domain\":\"#domain#\",\r\n\"key\":\"#access_secret#\"\r\n}",
+			WebhookHeaders:     " {\r\n\"Authorization\":\"Bearer #access_secret#\",\r\n\"X-Domain\":\"#domain#\"\r\n} ",
+		},
+	}
+
+	body, err := provider.reqBody()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record map[string]string
+	if err := json.Unmarshal([]byte(body), &record); err != nil {
+		t.Fatalf("body is not JSON: %v: %s", err, body)
+	}
+	expect := map[string]string{"ip": "1.1.1.1", "domain": domain, "key": `stored"secret\`}
+	if !maps.Equal(record, expect) {
+		t.Fatalf("placeholder value changed the JSON document: %s", body)
+	}
+
+	req, _, err := provider.prepareRequest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.Get("Authorization"); got != `Bearer stored"secret\` {
+		t.Fatalf("placeholder value replaced a header: Authorization: %s", got)
+	}
+	if got := req.Header.Get("X-Domain"); got != domain {
+		t.Fatalf("unexpected X-Domain: %s", got)
+	}
+	if len(req.Header) != 3 { // Content-Type and the two of the template
+		t.Fatalf("placeholder value added a header: %v", req.Header)
+	}
+	if got := req.URL.Query(); len(got) != 1 || got.Get("domain") != domain {
+		t.Fatalf("placeholder value changed the query: %s", req.URL.RawQuery)
 	}
 }

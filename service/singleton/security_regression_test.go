@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -172,6 +173,34 @@ func TestCronTriggerSendsToMemberOwnedServer(t *testing.T) {
 	CronTrigger(cronTask)()
 
 	assertTaskCommand(t, memberStream, "id")
+}
+
+func TestCronTriggerRejectsOversizedCommand(t *testing.T) {
+	memberStream := newCapturedTaskStream()
+	replaceServerSharedForSecurityTest(t,
+		withTaskStream(&model.Server{Common: model.Common{ID: 1, UserID: 100}, Name: "member-server"}, memberStream),
+	)
+	replaceUserInfoMapForSecurityTest(t, map[uint64]model.UserInfo{
+		100: {Role: model.RoleMember},
+	})
+
+	// A row that reached memory without passing Cron.BeforeSave must not be
+	// encoded once per covered Agent; the largest allowed command still is.
+	cronTask := &model.Cron{
+		Common:  model.Common{ID: 99, UserID: 100},
+		Command: strings.Repeat("#", model.MaxCronCommandBytes+1),
+		Cover:   model.CronCoverAll,
+	}
+	CronTrigger(cronTask)()
+	select {
+	case task := <-memberStream.tasks:
+		t.Fatalf("expected no task to be sent, got a %d-byte command", len(task.GetData()))
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cronTask.Command = cronTask.Command[1:]
+	CronTrigger(cronTask)()
+	assertTaskCommand(t, memberStream, cronTask.Command)
 }
 
 func TestCronTriggerAdminCronFansOutAcrossOwners(t *testing.T) {
@@ -487,6 +516,29 @@ func TestCanReportCronResultCronCoverAllRejectsReporterInDenyList(t *testing.T) 
 	}
 }
 
+// dispatchCronForSecurityTest runs cr through CronTrigger with reporter online
+// and waits for the task to reach its stream, leaving behind exactly the result
+// authorization a real run leaves.
+func dispatchCronForSecurityTest(t *testing.T, cr *model.Cron, reporter *model.Server) {
+	t.Helper()
+
+	stream := newCapturedTaskStream()
+	replaceServerSharedForSecurityTest(t, withTaskStream(reporter, stream))
+	originalCronShared := CronShared
+	t.Cleanup(func() { CronShared = originalCronShared })
+	CronShared = &CronClass{
+		class: class[uint64, *model.Cron]{list: map[uint64]*model.Cron{cr.ID: cr}},
+	}
+
+	CronTrigger(cr)()
+
+	select {
+	case <-stream.tasks:
+	case <-time.After(time.Second):
+		t.Fatal("expected CronTrigger to dispatch the cron task to the reporter")
+	}
+}
+
 func TestCanReportCronResultCronCoverAllAcceptsReporterNotInDenyList(t *testing.T) {
 	cr := &model.Cron{
 		Common:  model.Common{ID: 7, UserID: 100},
@@ -494,6 +546,7 @@ func TestCanReportCronResultCronCoverAllAcceptsReporterNotInDenyList(t *testing.
 		Servers: []uint64{99},
 	}
 	reporter := &model.Server{Common: model.Common{ID: 1, UserID: 100}}
+	dispatchCronForSecurityTest(t, cr, reporter)
 
 	if !CanReportCronResult(cr, reporter) {
 		t.Fatal("CronCoverAll with reporter NOT in Servers must accept — CronTrigger dispatches to it")
@@ -507,9 +560,128 @@ func TestCanReportCronResultCronCoverIgnoreAllAcceptsReporterInAllowList(t *test
 		Servers: []uint64{1},
 	}
 	reporter := &model.Server{Common: model.Common{ID: 1, UserID: 100}}
+	dispatchCronForSecurityTest(t, cr, reporter)
 
 	if !CanReportCronResult(cr, reporter) {
 		t.Fatal("CronCoverIgnoreAll treats Servers as allow-list; reporter in the list must be accepted")
+	}
+}
+
+// Being inside a scheduled cron's cover is not enough: an admin's cover-all
+// cron covers every member's server, whose agent could otherwise report runs
+// that never happened, at any time and any number of times.
+func TestCanReportCronResultRequiresDispatchForScheduledCovers(t *testing.T) {
+	for name, cr := range map[string]*model.Cron{
+		"CronCoverAll":       {Common: model.Common{ID: 42, UserID: 1}, Command: "backup", Cover: model.CronCoverAll},
+		"CronCoverIgnoreAll": {Common: model.Common{ID: 42, UserID: 1}, Command: "backup", Cover: model.CronCoverIgnoreAll, Servers: []uint64{7}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			replaceUserInfoMapForSecurityTest(t, map[uint64]model.UserInfo{
+				1:   {Role: model.RoleAdmin},
+				200: {Role: model.RoleMember},
+			})
+			reporter := &model.Server{Common: model.Common{ID: 7, UserID: 200}, Name: "member-server"}
+			originalCronShared := CronShared
+			t.Cleanup(func() { CronShared = originalCronShared })
+			CronShared = &CronClass{}
+
+			if CanReportCronResult(cr, reporter) {
+				t.Fatal("result must be rejected while the cron was never dispatched to the reporter")
+			}
+
+			dispatchCronForSecurityTest(t, cr, reporter)
+
+			if !CanReportCronResult(cr, reporter) {
+				t.Fatal("result for a dispatched task must be accepted")
+			}
+			if CanReportCronResult(cr, reporter) {
+				t.Fatal("one dispatched task must authorize only one result")
+			}
+		})
+	}
+}
+
+// blockedTaskStream keeps the first Send in flight so later tasks pile up in
+// the per-stream queue until QueueTaskGuarded refuses them.
+type blockedTaskStream struct {
+	capturedTaskStream
+	release chan struct{}
+}
+
+func (s *blockedTaskStream) Send(task *pb.Task) error {
+	<-s.release
+	s.tasks <- task
+	return nil
+}
+
+func TestCronTriggerRevokesScheduledAuthorizationWhenTaskIsNotQueued(t *testing.T) {
+	const runs = 32
+	blocked := &blockedTaskStream{
+		capturedTaskStream: capturedTaskStream{tasks: make(chan *pb.Task, runs)},
+		release:            make(chan struct{}),
+	}
+	reporter := withTaskStream(&model.Server{Common: model.Common{ID: 7, UserID: 100}, Name: "stalled-server"}, blocked)
+	replaceServerSharedForSecurityTest(t, reporter)
+
+	originalCronShared := CronShared
+	t.Cleanup(func() { CronShared = originalCronShared })
+	CronShared = &CronClass{}
+
+	cr := &model.Cron{Common: model.Common{ID: 42, UserID: 100}, Cover: model.CronCoverAll}
+	for range runs {
+		CronTrigger(cr)()
+	}
+
+	accepted := 0
+	for accepted < runs && CanReportCronResult(cr, reporter) {
+		accepted++
+	}
+	if accepted == 0 {
+		t.Fatal("queued tasks must leave a result authorization")
+	}
+	if accepted >= runs {
+		t.Fatalf("tasks refused by the full queue must not leave a result authorization, got %d for %d runs", accepted, runs)
+	}
+
+	// Every authorization belongs to a task that is still delivered once the stream moves again.
+	close(blocked.release)
+	for range accepted {
+		select {
+		case <-blocked.tasks:
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected every queued cron task to be sent")
+		}
+	}
+}
+
+func TestCronResultAuthorizationIsBoundedPerServer(t *testing.T) {
+	cronClass := &CronClass{}
+	for range cronResultAuthorizationLimit + 8 {
+		cronClass.reserveAlertTriggerCronResult(42, 7)
+	}
+
+	if pending := len(cronClass.pendingAlertTriggerTasks[42][7]); pending != cronResultAuthorizationLimit {
+		t.Fatalf("expected at most %d pending authorizations for one cron/server pair, got %d", cronResultAuthorizationLimit, pending)
+	}
+}
+
+func TestCronResultAuthorizationExpiresBetweenSweeps(t *testing.T) {
+	now := time.Now()
+	cronClass := &CronClass{
+		pendingAlertTriggerTasks: map[uint64]map[uint64][]time.Time{
+			42: {7: {now.Add(-time.Second), now.Add(time.Hour)}},
+		},
+		pendingAlertTriggerSweptAt: now,
+	}
+
+	if !cronClass.consumeAlertTriggerCronResult(42, 7) {
+		t.Fatal("expected the unexpired authorization to be consumed")
+	}
+	if cronClass.consumeAlertTriggerCronResult(42, 7) {
+		t.Fatal("an expired authorization must not be accepted before the next sweep")
+	}
+	if len(cronClass.pendingAlertTriggerTasks) != 0 {
+		t.Fatal("expired authorization must be dropped when its pair is consumed")
 	}
 }
 
@@ -753,6 +925,45 @@ func TestServiceMonitorResultAllowsCoveredReporterForAdminOwnedService(t *testin
 	ss.Dispatch(serviceMonitorResult(2, 10, model.TaskTypeTCPPing, true))
 
 	waitForServiceHistory(t, 10, 2)
+}
+
+func TestServiceMonitorResultFromMemberServerDoesNotDecideAdminOwnedService(t *testing.T) {
+	replaceUserInfoMapForSecurityTest(t, map[uint64]model.UserInfo{
+		1:   {Role: model.RoleAdmin},
+		2:   {Role: model.RoleAdmin},
+		200: {Role: model.RoleMember},
+	})
+	ss := newServiceMonitorSecurityHarness(t,
+		&model.Server{Common: model.Common{ID: 1, UserID: 1}, Name: "owner-server"},
+		&model.Server{Common: model.Common{ID: 2, UserID: 200}, Name: "member-server"},
+		&model.Server{Common: model.Common{ID: 3, UserID: 2}, Name: "other-admin-server"},
+	)
+	addServiceMonitorSecurityService(t, ss, &model.Service{
+		Common:   model.Common{ID: 10, UserID: 1},
+		Name:     "admin-service",
+		Type:     model.TaskTypeTCPPing,
+		Target:   "example.invalid:443",
+		Duration: 3600,
+		Cover:    model.ServiceCoverAll,
+	})
+
+	ss.Dispatch(serviceMonitorResult(1, 10, model.TaskTypeTCPPing, true))
+	ss.Dispatch(serviceMonitorResult(2, 10, model.TaskTypeTCPPing, false))
+	ss.Dispatch(serviceMonitorResult(3, 10, model.TaskTypeTCPPing, true))
+
+	// The member server keeps its per-server history, but only the servers of
+	// the service owner and of the other admin decide the shared state.
+	waitForServiceHistory(t, 10, 2)
+	waitForTodayStats(t, ss, 10, 2, 0)
+
+	ss.serviceResponseDataStoreLock.RLock()
+	defer ss.serviceResponseDataStoreLock.RUnlock()
+	if current := ss.serviceResponseDataStore[10]; current.Up != 2 || current.Down != 0 {
+		t.Fatalf("member server moved the admin service window: up=%d down=%d", current.Up, current.Down)
+	}
+	if lastStatus := ss.serviceCurrentStatusData[10].lastStatus; lastStatus != StatusGood {
+		t.Fatalf("expected admin service status %d, got %d", StatusGood, lastStatus)
+	}
 }
 
 func newServiceMonitorSecurityHarness(t *testing.T, servers ...*model.Server) *ServiceSentinel {

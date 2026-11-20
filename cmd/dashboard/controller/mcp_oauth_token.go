@@ -128,6 +128,11 @@ func mcpOAuthToken(c *gin.Context) {
 		code := "invalid_grant"
 		if form.Get("grant_type") != "authorization_code" && form.Get("grant_type") != "refresh_token" {
 			code = "unsupported_grant_type"
+		} else if err != nil && !errors.Is(err, errMCPOAuthInvalidGrant) {
+			// A storage failure rolled the transaction back, so nothing was
+			// consumed or revoked. Do not report it as a verdict on the grant.
+			mcpOAuthError(c, http.StatusServiceUnavailable, "temporarily_unavailable", "token endpoint unavailable")
+			return
 		}
 		mcpOAuthError(c, 400, code, errMCPOAuthInvalidGrant.Error())
 		return
@@ -156,8 +161,11 @@ func mcpOAuthExchangeCode(tx *gorm.DB, client *model.MCPOAuthClient, form url.Va
 	if tx.First(&user, code.UserID).Error != nil || user.TokenVersion != code.UserVersion {
 		return nil, 0, errMCPOAuthInvalidGrant
 	}
+	// Count the grants themselves. api_tokens also holds the user's personal
+	// tokens, which are unbounded and may carry any name, and this transaction
+	// already holds the database write lock while it counts.
 	var count int64
-	if err := tx.Model(&model.APIToken{}).Where("user_id = ? AND name LIKE ? AND expires_at > ?", user.ID, "OAuth: %", time.Now()).Count(&count).Error; err != nil {
+	if err := tx.Model(&model.MCPOAuthGrant{}).Where("user_id = ? AND expires_at > ?", user.ID, time.Now()).Count(&count).Error; err != nil {
 		return nil, 0, err
 	}
 	if count >= 100 {
@@ -167,11 +175,11 @@ func mcpOAuthExchangeCode(tx *gorm.DB, client *model.MCPOAuthClient, form url.Va
 	expiry := now.Add(mcpOAuthGrantLifetime)
 	// No plaintext PAT is returned or persisted. Only the dedicated nzo_
 	// credential can resolve this permission identity, and only on /mcp.
-	permission := model.APIToken{UserID: user.ID, Name: "OAuth: " + client.Name, TokenHash: model.HashAPIToken(mcpOAuthRandom()), ScopesCSV: code.ScopesCSV, ServersCSV: code.ServersCSV, ExpiresAt: &expiry}
+	permission := model.APIToken{UserID: user.ID, UserVersion: user.TokenVersion, Name: "OAuth: " + client.Name, TokenHash: model.HashAPIToken(mcpOAuthRandom()), ScopesCSV: code.ScopesCSV, ServersCSV: code.ServersCSV, ExpiresAt: &expiry}
 	if err := tx.Create(&permission).Error; err != nil {
 		return nil, 0, err
 	}
-	grant := model.MCPOAuthGrant{ID: mcpOAuthRandom(), APITokenID: permission.ID, ClientID: client.ID, Resource: code.Resource, UserVersion: user.TokenVersion, ExpiresAt: expiry}
+	grant := model.MCPOAuthGrant{ID: mcpOAuthRandom(), APITokenID: permission.ID, UserID: user.ID, ClientID: client.ID, Resource: code.Resource, UserVersion: user.TokenVersion, ExpiresAt: expiry}
 	response := mcpOAuthRotateCredentials(&grant, permission.Scopes())
 	if err := tx.Create(&grant).Error; err != nil {
 		return nil, 0, err
@@ -262,6 +270,19 @@ func mcpOAuthDeleteGrant(tx *gorm.DB, grant *model.MCPOAuthGrant) error {
 	return tx.Where("id = ?", grant.ID).Delete(&model.MCPOAuthGrant{}).Error
 }
 
+// mcpOAuthDeletePendingCodes drops the authorization codes that the owner of
+// an OAuth permission identity approved for the same client but that were not
+// exchanged yet. They are not listed as authorizations, so a dashboard
+// revocation must take them along or the client mints a fresh grant from one
+// right afterwards. Exchanged codes stay: replay detection still needs them.
+// Call it before the api_tokens row is deleted.
+func mcpOAuthDeletePendingCodes(tx *gorm.DB, apiTokenID uint64) error {
+	return tx.Where("grant_id = ? AND client_id IN (?) AND user_id IN (?)", "",
+		tx.Model(&model.MCPOAuthGrant{}).Select("client_id").Where("api_token_id = ?", apiTokenID),
+		tx.Model(&model.APIToken{}).Select("user_id").Where("id = ?", apiTokenID)).
+		Delete(&model.MCPOAuthCode{}).Error
+}
+
 func mcpOAuthRevoke(c *gin.Context) {
 	client, err := mcpOAuthClientFromForm(c)
 	if err != nil {
@@ -308,7 +329,18 @@ func mcpOAuthAccessAuth(c *gin.Context) {
 		return
 	}
 	var grant model.MCPOAuthGrant
-	if len(plain) > 128 || singleton.DB.First(&grant, "access_hash = ?", model.HashAPIToken(plain)).Error != nil || !time.Now().Before(grant.AccessExpiresAt) || grant.Resource != issuer+"/mcp" {
+	err = gorm.ErrRecordNotFound
+	if len(plain) <= 128 {
+		err = singleton.DB.First(&grant, "access_hash = ?", model.HashAPIToken(plain)).Error
+	}
+	// A token that matches no grant is a guess: count it on the same WAF
+	// counter as an unknown PAT, which this request never reaches. An issued
+	// token that merely expired is not counted, so that the client is not
+	// blocked right before it refreshes.
+	if errors.Is(err, gorm.ErrRecordNotFound) && !apiTokenAuthReadOnly(c) {
+		model.BlockIP(singleton.DB, c.GetString(model.CtxKeyRealIPStr), model.WAFBlockReasonTypeBruteForceToken, model.BlockIDToken)
+	}
+	if err != nil || !time.Now().Before(grant.AccessExpiresAt) || grant.Resource != issuer+"/mcp" {
 		abortAPITokenUnauthorized(c, "invalid or expired MCP OAuth token")
 		return
 	}

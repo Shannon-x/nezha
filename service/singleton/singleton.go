@@ -6,7 +6,9 @@ import (
 	"iter"
 	"log"
 	"maps"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,6 +115,9 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 		if path == "" {
 			path = "data/sqlite.db"
 		}
+		if err := restrictSQLiteFileMode(path); err != nil {
+			log.Printf("NEZHA>> database file %s may be readable by other users: %v", path, err)
+		}
 		dialector = openSQLiteDialector(path)
 		log.Printf("NEZHA>> Using SQLite database at %s", path)
 	default:
@@ -143,6 +148,9 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 		}
 	}
 	migrateServiceVisibility := model.NeedsServiceHideForGuestMigration(DB)
+	// Tokens issued before api_tokens.user_version existed inherit the owner's
+	// current version, so an upgrade keeps them valid until the next credential change.
+	backfillAPITokenUserVersion := DB.Migrator().HasTable(&model.APIToken{}) && !DB.Migrator().HasColumn(&model.APIToken{}, "user_version")
 	err = DB.AutoMigrate(model.Server{}, model.User{}, model.ServerGroup{}, model.NotificationGroup{},
 		model.Notification{}, model.AlertRule{}, model.Service{}, model.NotificationGroupNotification{},
 		model.ServiceHistory{}, model.Cron{}, model.Transfer{}, model.ServerGroupServer{},
@@ -162,6 +170,16 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 			return fmt.Errorf("failed to migrate service visibility: %w", err)
 		}
 	}
+	if backfillAPITokenUserVersion {
+		if err := DB.Exec("UPDATE api_tokens SET user_version = COALESCE((SELECT token_version FROM users WHERE users.id = api_tokens.user_id), 0)").Error; err != nil {
+			return err
+		}
+	}
+	// Grants issued before mcp_oauth_grants.user_id existed take the owner of
+	// their permission identity, so they keep counting towards the per-user cap.
+	if err := DB.Exec("UPDATE mcp_oauth_grants SET user_id = COALESCE((SELECT user_id FROM api_tokens WHERE api_tokens.id = mcp_oauth_grants.api_token_id), 0) WHERE user_id = 0").Error; err != nil {
+		return err
+	}
 
 	// 旧 mcp:* scope 与 nezha:* 并行了一段时间，HasScope 通过别名让 mcp:fs:write
 	// 静默扩到 REST nezha:server:write。统一命名后这里把残留旧 scope 一次性
@@ -172,6 +190,38 @@ func InitDB(dbConfig model.DatabaseConfig) error {
 		log.Printf("NEZHA>> Migrated legacy mcp:* api token scopes: rewritten=%d deleted=%d", rewritten, deleted)
 	}
 
+	return nil
+}
+
+// restrictSQLiteFileMode makes the database owner-only before SQLite opens it.
+// SQLite creates the database 0644 and gives its -journal/-wal/-shm files the
+// mode of the database, so the file is created here with 0600 and files that
+// already exist are tightened. The database holds password hashes, agent
+// secrets, session ids and notification / DDNS credentials.
+func restrictSQLiteFileMode(dsn string) error {
+	// Same DSN handling as go-sqlite3: options follow '?'. file: URIs and
+	// in-memory / temporary databases are left to SQLite.
+	if strings.HasPrefix(dsn, "file:") {
+		return nil
+	}
+	if pos := strings.IndexRune(dsn, '?'); pos >= 1 {
+		dsn = dsn[:pos]
+	}
+	if dsn == "" || dsn == ":memory:" {
+		return nil
+	}
+
+	f, err := os.OpenFile(dsn, os.O_RDONLY|os.O_CREATE, 0600) // #nosec G304 -- dsn is the operator-configured database path
+	if err != nil {
+		return err
+	}
+	f.Close()
+
+	for _, suffix := range []string{"", "-journal", "-wal", "-shm"} {
+		if err := utils.RestrictFileToOwner(dsn + suffix); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -215,6 +265,16 @@ func PersistTransfer(transfer model.Transfer) error {
 	return DB.Create(&transfer).Error
 }
 
+// PruneExpiredWAFBlocks 清理封禁已到期的 WAF 记录
+func PruneExpiredWAFBlocks() {
+	if DB == nil {
+		return
+	}
+	if err := model.PruneExpiredBlocks(DB); err != nil {
+		log.Printf("NEZHA>> Failed to prune expired WAF records: %v", err)
+	}
+}
+
 // CleanMonitorHistory 清理流量记录（TSDB 有自己的保留策略）
 func CleanMonitorHistory() {
 	// Audit retention is finite even when MCP was subsequently disabled.
@@ -244,6 +304,18 @@ func CleanMonitorHistory() {
 		log.Printf("NEZHA>> Failed to load alert rules while cleaning transfer history: %v", err)
 		return
 	}
+	// Rule.Ignore is user-supplied and unbounded. Transfers of servers that do
+	// not exist were removed above, so only IDs of existing servers need their
+	// own retention; this bounds the statements below by the number of servers.
+	var serverIDs []uint64
+	if err := DB.Model(&model.Server{}).Pluck("id", &serverIDs).Error; err != nil {
+		log.Printf("NEZHA>> Failed to load servers while cleaning transfer history: %v", err)
+		return
+	}
+	existingServers := make(map[uint64]struct{}, len(serverIDs))
+	for _, id := range serverIDs {
+		existingServers[id] = struct{}{}
+	}
 	for _, alert := range alerts {
 		for _, rule := range alert.Rules {
 			// 是不是流量记录规则
@@ -263,15 +335,19 @@ func CleanMonitorHistory() {
 					if !included {
 						continue
 					}
+					if _, exists := existingServers[id]; !exists {
+						continue
+					}
 					if specialServerKeep[id].IsZero() || specialServerKeep[id].After(dataCouldRemoveBefore) {
 						specialServerKeep[id] = dataCouldRemoveBefore
-						specialServerIDs = append(specialServerIDs, id)
 					}
 				}
 			}
 		}
 	}
 	for id, couldRemove := range specialServerKeep {
+		// One entry per server, however many rules list it.
+		specialServerIDs = append(specialServerIDs, id)
 		// Retain history required by either a global or server-specific rule.
 		if !allServerKeep.IsZero() && allServerKeep.Before(couldRemove) {
 			couldRemove = allServerKeep

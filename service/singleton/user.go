@@ -90,12 +90,33 @@ func OnUserUpdate(u *model.User) {
 }
 
 func OnUserDelete(id []uint64, errorFunc func(string, ...any) error) error {
-	UserLock.Lock()
-	defer UserLock.Unlock()
+	// Runs after UserLock is released: unregistering scheduled tasks takes time
+	// per task, and every Agent request and alert check waits for UserLock.
+	// Until then a task that fires covers nothing, because its owner is gone.
+	var deletedCrons []uint64
+	defer func() {
+		if len(deletedCrons) > 0 {
+			CronShared.Delete(deletedCrons)
+		}
+	}()
 
 	if len(id) < 1 {
 		return Localizer.ErrorT("user id not specified")
 	}
+
+	// A server on its way to a deleted user (Pending transfer) is already
+	// attributed to them but still belongs to its source user. Hand it back
+	// before the loop below picks the servers to delete by UserID. This runs
+	// before UserLock is taken: the rollback waits for the server control
+	// lock and pushes the revert to an online agent.
+	if ServerTransferShared != nil {
+		if err := ServerTransferShared.ReturnPendingToSource(id); err != nil {
+			return errorFunc("%v", err)
+		}
+	}
+
+	UserLock.Lock()
+	defer UserLock.Unlock()
 
 	if ServerTransferShared != nil {
 		ServerTransferShared.OnUsersDeleted(id)
@@ -144,7 +165,7 @@ func OnUserDelete(id []uint64, errorFunc func(string, ...any) error) error {
 		}
 
 		if cron {
-			CronShared.Delete(crons)
+			deletedCrons = append(deletedCrons, crons...)
 		}
 
 		if server {

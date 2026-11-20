@@ -23,7 +23,12 @@ const (
 	maxArchiveSize   int64 = 64 << 20
 	maxExtractedSize int64 = 256 << 20
 	maxArchiveFiles        = 10000
+	maxArchiveDepth        = 64
+	// About 400 bytes of name, extra field and comment for each permitted entry.
+	maxArchiveDirectory int64 = 4 << 20
 )
+
+var errArchiveDirectory = errors.New("frontend archive directory exceeds 4 MiB")
 
 type Template struct {
 	Path       string `json:"path,omitempty"`
@@ -244,12 +249,45 @@ func (s *Store) Remove(id string, admin bool) error {
 	return errors.New("frontend is not installed for the selected role")
 }
 
+// directoryBudget limits how much of an archive archive/zip may read while it
+// lists the entries. The listing turns every central directory record into heap
+// objects several times its size before maxArchiveFiles can be compared with
+// their number, and it trusts no count stated in the archive, so only the bytes
+// it is allowed to read bound that cost.
+type directoryBudget struct {
+	io.ReaderAt
+	remaining int64
+	listed    bool
+}
+
+func (b *directoryBudget) ReadAt(p []byte, offset int64) (int, error) {
+	if !b.listed {
+		if b.remaining -= int64(len(p)); b.remaining < 0 {
+			return 0, errArchiveDirectory
+		}
+	}
+	return b.ReaderAt.ReadAt(p, offset)
+}
+
 func extractDistribution(ctx context.Context, archivePath, destination string) error {
-	archive, err := zip.OpenReader(archivePath)
+	file, err := os.Open(archivePath) // #nosec G304 -- archivePath is the store-created temporary download, not user input
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	budget := &directoryBudget{ReaderAt: file, remaining: maxArchiveDirectory}
+	archive, err := zip.NewReader(budget, info.Size())
+	if errors.Is(err, errArchiveDirectory) {
+		return err
+	}
 	if err != nil {
 		return fmt.Errorf("invalid frontend ZIP: %w", err)
 	}
-	defer archive.Close()
+	budget.listed = true
 	root, err := os.OpenRoot(destination)
 	if err != nil {
 		return err
@@ -259,6 +297,9 @@ func extractDistribution(ctx context.Context, archivePath, destination string) e
 		return errors.New("frontend archive contains too many files")
 	}
 	seen := make(map[string]bool)
+	// Parent directories are created whether or not the archive lists them, so
+	// the file limit counts every filesystem object rather than every ZIP entry.
+	created := make(map[string]bool)
 	var extracted int64
 	for _, entry := range archive.File {
 		if err := ctx.Err(); err != nil {
@@ -269,6 +310,15 @@ func extractDistribution(ctx context.Context, archivePath, destination string) e
 			return errors.New("frontend archive must contain only safe paths beneath dist/")
 		}
 		seen[name] = true
+		if strings.Count(name, "/") >= maxArchiveDepth {
+			return errors.New("frontend archive paths are nested too deeply")
+		}
+		for object := name; object != "." && !created[object]; object = path.Dir(object) {
+			created[object] = true
+			if len(created) > maxArchiveFiles {
+				return errors.New("frontend archive contains too many files")
+			}
+		}
 		if entry.Mode()&os.ModeSymlink != 0 || (!entry.FileInfo().IsDir() && !entry.Mode().IsRegular()) {
 			return errors.New("frontend archive cannot contain links or special files")
 		}

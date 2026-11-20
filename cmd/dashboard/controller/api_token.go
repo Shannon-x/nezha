@@ -139,9 +139,10 @@ func createAPIToken(c *gin.Context) (*model.APITokenCreateResponse, error) {
 	plaintext := model.APITokenPrefix + secret
 
 	tok := model.APIToken{
-		UserID:    getUid(c),
-		Name:      req.Name,
-		TokenHash: model.HashAPIToken(plaintext),
+		UserID:      getUid(c),
+		UserVersion: c.MustGet(model.CtxKeyAuthorizedUser).(*model.User).TokenVersion,
+		Name:        req.Name,
+		TokenHash:   model.HashAPIToken(plaintext),
 	}
 	tok.SetScopes(cleaned)
 	if len(req.ServerIDs) > 0 {
@@ -179,16 +180,30 @@ func deleteAPIToken(c *gin.Context) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	q := singleton.DB.Where("id = ?", id)
-	if !callerIsAdmin(c) {
-		q = q.Where("user_id = ?", getUid(c))
-	}
-	res := q.Delete(&model.APIToken{})
-	if res.Error != nil {
-		return nil, newGormError("%v", res.Error)
-	}
-	if res.RowsAffected == 0 {
-		return nil, errors.New("not found")
+	err = mcpOAuthTransaction(func(tx *gorm.DB) error {
+		q := tx.Where("id = ?", id)
+		if !callerIsAdmin(c) {
+			q = q.Where("user_id = ?", getUid(c))
+		}
+		var tok model.APIToken
+		if err := q.Take(&tok).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("not found")
+			}
+			return newGormError("%v", err)
+		}
+		// An "OAuth: <client>" row is the permission identity of an MCP OAuth
+		// grant, so deleting it revokes that authorization as a whole.
+		if err := mcpOAuthDeletePendingCodes(tx, tok.ID); err != nil {
+			return newGormError("%v", err)
+		}
+		if err := tx.Delete(&tok).Error; err != nil {
+			return newGormError("%v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	// Fan out the revocation to any active long-lived connection that
 	// carries this PAT — ws/server, ws/transfer, terminal, FM. Without
@@ -258,6 +273,12 @@ func authenticateAPITokenIdentity(c *gin.Context, tok *model.APIToken) {
 			model.BlockIP(singleton.DB, realIP, model.WAFBlockReasonTypeBruteForceToken, model.BlockIDToken)
 		}
 		abortAPITokenUnauthorized(c, "owner of api token not found")
+		return
+	}
+	// Same rule as JWT sessions and MCP OAuth grants: a credential issued
+	// before the owner's password/profile change must not outlive it.
+	if user.TokenVersion != tok.UserVersion {
+		abortAPITokenUnauthorized(c, "api token revoked by credential change")
 		return
 	}
 

@@ -145,6 +145,16 @@ type ServerTransferClass struct {
 	// concurrent callers could both pass the HasPending guard, both run
 	// their transactions, and both succeed in creating Pending rows.
 	initiating map[uint64]bool
+	// verifying tracks servers whose MarkVerified call is currently running
+	// the Pending -> Verified CAS in the DB, which it must do without holding
+	// mu (see MarkVerified). The pending entry stays published for that time,
+	// so everything it keeps closed stays closed; what it would open is
+	// refused on this mark instead (PendingSourceOwner, InitiateExclusive).
+	verifying map[uint64]bool
+	// verifyLocks serializes MarkVerified per server, so a second presentation
+	// of the same HandshakeSecret waits for the first one's outcome. Do not
+	// use c.mu for this: the CAS is a DB write and may block.
+	verifyLocks sync.Map
 	// applyConfigSendLocks orders ApplyConfig sends per server transfer lifecycle.
 	// Do not use c.mu for this: stream.Send may block, but stale new-secret
 	// pushes and cancel/fail/timeout revert pushes must not overtake each other
@@ -224,6 +234,7 @@ func NewServerTransferClass() *ServerTransferClass {
 		terminalSecretRecovery: make(map[uint64]*model.ServerTransfer),
 		verifiedHandshakes:     make(map[uint64]string),
 		initiating:             make(map[uint64]bool),
+		verifying:              make(map[uint64]bool),
 		subs:                   make(map[uint64]chan *model.ServerTransfer),
 		subOwners:              make(map[uint64]uint64),
 		subCounts:              make(map[uint64]int),
@@ -317,8 +328,7 @@ func NewServerTransferClass() *ServerTransferClass {
 		transferID uint64
 		secret     string
 		ackedAt    time.Time
-		isRevert   bool
-		toUserID   uint64
+		ownerID    uint64
 	}
 	candidates := make([]credCandidate, 0, len(verified)+len(rollbackAcked))
 	for i := range verified {
@@ -331,7 +341,7 @@ func NewServerTransferClass() *ServerTransferClass {
 			transferID: t.ID,
 			secret:     t.HandshakeSecret,
 			ackedAt:    *t.AckedAt,
-			toUserID:   t.ToUserID,
+			ownerID:    t.ToUserID,
 		})
 	}
 	for i := range rollbackAcked {
@@ -344,8 +354,7 @@ func NewServerTransferClass() *ServerTransferClass {
 			transferID: t.ID,
 			secret:     t.RevertHandshakeSecret,
 			ackedAt:    *t.AckedAt,
-			isRevert:   true,
-			toUserID:   t.FromUserID,
+			ownerID:    t.FromUserID,
 		})
 	}
 	// Sort newest-first by AckedAt, breaking ties with transferID. AckedAt
@@ -363,30 +372,34 @@ func NewServerTransferClass() *ServerTransferClass {
 		return candidates[i].ackedAt.After(candidates[j].ackedAt)
 	})
 
+	// Only the newest candidate of each server is eligible, whether or not it
+	// passes the ownership gate below. Every older candidate was overwritten
+	// in verifiedHandshakes by the rotation that produced the newer one, so
+	// falling back to it would re-admit a credential the dashboard had
+	// already retired (and that a previous owner may still hold a copy of).
+	decided := make(map[uint64]bool, len(candidates))
 	for _, cand := range candidates {
-		if _, alreadySeen := c.verifiedHandshakes[cand.serverID]; alreadySeen {
+		if decided[cand.serverID] {
 			continue
 		}
+		decided[cand.serverID] = true
 		server, ok := ServerShared.Get(cand.serverID)
 		if !ok || server == nil {
 			continue
 		}
-		// Forward Verified credential is accepted when either the server
-		// still belongs to ToUserID (steady state) or a subsequent transfer
-		// is Pending whose FromUserID equals this ToUserID (chained-transfer
-		// rollover window — agent on disk still holds the previous
-		// HandshakeSecret until MarkVerified on the new transfer).
-		// Rollback credential is accepted only when current owner still
-		// equals the original FromUserID (the rollback target).
-		if cand.isRevert {
-			if server.GetUserID() != cand.toUserID {
+		// The credential is accepted when either the server still belongs to
+		// the user it was issued under — ToUserID for a forward Verified
+		// credential, FromUserID (the rollback target) for an acked rollback
+		// credential — (steady state) or a subsequent transfer is Pending
+		// whose FromUserID equals that user (chained-transfer rollover
+		// window — Register leaves verifiedHandshakes alone, so the agent on
+		// disk still holds this secret until MarkVerified on the new
+		// transfer). The rollover window applies to both kinds: a transfer
+		// retried after its rollback was acked is Pending on top of the
+		// rollback credential.
+		if server.GetUserID() != cand.ownerID {
+			if pending, hasPending := c.pending[cand.serverID]; !hasPending || pending.FromUserID != cand.ownerID {
 				continue
-			}
-		} else {
-			if server.GetUserID() != cand.toUserID {
-				if pending, hasPending := c.pending[cand.serverID]; !hasPending || pending.FromUserID != cand.toUserID {
-					continue
-				}
 			}
 		}
 		c.verifiedHandshakes[cand.serverID] = cand.secret
@@ -405,13 +418,38 @@ func (c *ServerTransferClass) Stop() {
 }
 
 // LookupPending returns the pending transfer for a server if one exists.
-// Hot path: called from authorizeAgentForUUID on every agent RPC, so it
-// uses an RWMutex and a map lookup only.
 func (c *ServerTransferClass) LookupPending(serverID uint64) (*model.ServerTransfer, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	t, ok := c.pending[serverID]
 	return t, ok
+}
+
+// LookupOwnerAndPending returns s's in-memory owner together with its pending
+// transfer (nil if none) as one snapshot under c.mu. authorizeAgentForUUID
+// must not read the two separately: Register publishes the entry before it
+// flips Server.UserID, a rollback restores Server.UserID before it drops the
+// entry, and only MarkVerified drops it while ToUserID stays the owner. A
+// reader holding c.mu therefore never sees ToUserID as the owner of an
+// unsettled transfer without the entry; two independent reads can.
+// Hot path: called on every agent RPC, so it uses an RWMutex, an atomic
+// load and a map lookup only.
+func (c *ServerTransferClass) LookupOwnerAndPending(s *model.Server) (uint64, *model.ServerTransfer) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return s.GetUserID(), c.pending[s.ID]
+}
+
+// PendingSourceOwner reports whether userID is the previous owner of a server
+// whose transfer is still Pending, i.e. whether auth may keep tolerating that
+// user's global AgentSecret for it. Not while MarkVerified is settling the
+// transfer: the DB row may already be Verified although the pending entry is
+// still published.
+func (c *ServerTransferClass) PendingSourceOwner(serverID, userID uint64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.pending[serverID]
+	return ok && t.FromUserID == userID && !c.verifying[serverID]
 }
 
 // HasPending reports whether the given server has an in-flight transfer.
@@ -618,6 +656,11 @@ func (c *ServerTransferClass) applyConfigSendLock(serverID uint64) *sync.Mutex {
 	return lock.(*sync.Mutex)
 }
 
+func (c *ServerTransferClass) verifyLock(serverID uint64) *sync.Mutex {
+	lock, _ := c.verifyLocks.LoadOrStore(serverID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
 // Initiate runs inside the given transaction and:
 //   - creates the ServerTransfer row with Status=Pending
 //   - flips Server.UserID to toUserID
@@ -674,17 +717,18 @@ func (c *ServerTransferClass) Initiate(tx *gorm.DB, serverID, fromUserID, toUser
 // committed, otherwise authorizeAgentForUUID could observe a transfer that
 // doesn't yet exist in the DB.
 //
-// Ordering invariant: the in-memory Server.UserID is updated BEFORE the
-// pending entry is published. Inverting these two would leave a window
-// where authorizeAgentForUUID still sees the old owner via ServerShared
-// and admits the old AgentSecret on the happy "owner match" path —
-// bypassing the bounded pending-tolerance contract.
+// Ordering invariant: the pending entry is published BEFORE the in-memory
+// Server.UserID is updated, mirroring revertTransition, which restores
+// Server.UserID before it drops the entry. authorizeAgentForUUID refuses the
+// destination user's global AgentSecret only while it finds the entry; in
+// the opposite order that secret matches the owner while nothing marks the
+// transfer as pending, and c.mu contention (every agent sign-in takes it)
+// stretches that window. In this order the previous owner still matches for
+// a moment with the entry already published; that secret is within the
+// pending tolerance anyway.
 func (c *ServerTransferClass) Register(t *model.ServerTransfer) {
 	releaseControl := lockServerControlTransition(t.ServerID)
 	defer releaseControl()
-	// SetUserID uses an atomic write because auth.go reads this hot-path field
-	// concurrently; ServerClass also serializes it with service reports.
-	ServerShared.setUserID(t.ServerID, t.ToUserID)
 
 	c.mu.Lock()
 	if c.controlEpoch == nil {
@@ -711,6 +755,10 @@ func (c *ServerTransferClass) Register(t *model.ServerTransfer) {
 	// Cancel/Fail/Timeout leave it in place so the agent stays online while
 	// ownership rolls back.
 	c.mu.Unlock()
+
+	// SetUserID uses an atomic write because auth.go reads this hot-path field
+	// concurrently; ServerClass also serializes it with service reports.
+	ServerShared.setUserID(t.ServerID, t.ToUserID)
 
 	// Ownership has rotated to ToUserID — tear down any IOStream the
 	// previous owner had open against this server so it cannot survive
@@ -743,7 +791,7 @@ func (c *ServerTransferClass) InitiateExclusive(serverID, fromUserID, toUserID, 
 		c.mu.Unlock()
 		return nil, ErrServerAlreadyTransferring
 	}
-	if c.initiating[serverID] {
+	if c.initiating[serverID] || c.verifying[serverID] {
 		c.mu.Unlock()
 		return nil, ErrServerAlreadyTransferring
 	}
@@ -974,26 +1022,45 @@ func (c *ServerTransferClass) sendApplyConfigTask(s *model.Server, stream pb.Nez
 // DB, the UPDATE affects zero rows and the in-memory state is left alone.
 // MarkVerified atomically transitions a Pending transfer to Verified.
 //
-// Invariant: c.mu is held across the DB CAS, the in-memory pending delete,
-// and the verifiedHandshakes write. Callers reading c.pending under c.mu
-// (auth.go's tolerance window) therefore can never observe a state where
-// the DB row is Verified but c.pending still flags the transfer as Pending —
-// the auth-bypass window that would otherwise let either a stale
-// HandshakeSecret or the old owner's global AgentSecret authenticate
-// between the two updates.
+// Invariant: auth can never act on a state where the DB row is Verified but
+// c.pending still flags the transfer as Pending — the auth-bypass window that
+// would otherwise let either a stale HandshakeSecret or the old owner's
+// global AgentSecret authenticate between the two updates.
+//
+// c.mu must NOT be what enforces this across the DB CAS: every agent auth
+// (LookupByHandshakeSecret & co.) and every non-admin control admission
+// (ServerControlTransitioning) takes c.mu for ANY server, and the agent
+// presenting the HandshakeSecret picks the moment the UPDATE runs. Holding
+// c.mu while that UPDATE waits for a DB connection or the write lock stalls
+// every other tenant's agents for as long as the DB is slow. Instead:
+//   - the per-server verify lock serializes MarkVerified for one server, so a
+//     concurrent presentation of the same HandshakeSecret waits for the
+//     outcome and then finds the promoted credential;
+//   - c.verifying[serverID] is set under c.mu before the CAS and cleared in
+//     the same c.mu hold that applies the outcome. While it is set the
+//     pending entry stays published (destination secret and control stay
+//     refused), the old owner's tolerance is withdrawn (PendingSourceOwner)
+//     and no new transfer can claim the slot (InitiateExclusive);
+//   - the in-memory pending delete and the verifiedHandshakes write are
+//     still a single c.mu critical section.
 //
 // Returns verified=true exactly when this call performed the Pending →
 // Verified transition for the supplied (serverID, transferID). All other
 // outcomes (no pending, transfer id mismatch, lost CAS, DB error) return
 // verified=false and the caller (auth) must reject the credential.
 func (c *ServerTransferClass) MarkVerified(serverID, transferID uint64) (verified bool, transfer *model.ServerTransfer, err error) {
-	c.mu.Lock()
+	lock := c.verifyLock(serverID)
+	lock.Lock()
+	defer lock.Unlock()
 
+	c.mu.Lock()
 	t, ok := c.pending[serverID]
 	if !ok || t.ID != transferID {
 		c.mu.Unlock()
 		return false, nil, nil
 	}
+	c.verifying[serverID] = true
+	c.mu.Unlock()
 
 	now := time.Now()
 	res := DB.Model(&model.ServerTransfer{}).
@@ -1002,15 +1069,20 @@ func (c *ServerTransferClass) MarkVerified(serverID, transferID uint64) (verifie
 			"status":   model.ServerTransferStatusVerified,
 			"acked_at": &now,
 		})
+
+	c.mu.Lock()
+	delete(c.verifying, serverID)
 	if res.Error != nil {
 		c.mu.Unlock()
 		return false, nil, res.Error
 	}
 	if res.RowsAffected == 0 {
-		// Concurrent caller settled the row to a terminal status. The
-		// in-memory pending entry is now stale; drop it so the next auth
-		// call cannot read it. Do NOT promote any handshake secret.
-		delete(c.pending, t.ServerID)
+		// Concurrent caller settled the row to a terminal status. Leave the
+		// stale in-memory pending entry to that caller: revertTransition
+		// drops it only after it has restored Server.UserID, and dropping
+		// it here first would expose ToUserID as owner with no pending
+		// entry (see LookupOwnerAndPending). Do NOT promote any handshake
+		// secret.
 		c.mu.Unlock()
 		return false, nil, nil
 	}
@@ -1317,6 +1389,39 @@ func (c *ServerTransferClass) OnServersDeleted(serverIDs []uint64) {
 	}
 }
 
+// ReturnPendingToSource rolls back, exactly as Cancel does, every Pending
+// transfer INTO one of userIDs whose source user is not being deleted as
+// well. Register has already written ToUserID into Server.UserID, but until
+// the agent rotates the server is still the source user's: Cancel/Fail/
+// Timeout hand it back, and deleting the destination user must do the same.
+// Otherwise singleton.OnUserDelete, which picks the servers to delete by
+// Server.UserID, would delete the source user's server and free its UUID for
+// whoever enrols it next.
+//
+// Must run BEFORE OnUsersDeleted and without UserLock held: the rollback
+// waits for the server control lock and pushes the revert to an online agent.
+func (c *ServerTransferClass) ReturnPendingToSource(userIDs []uint64) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+
+	var pending []model.ServerTransfer
+	if err := DB.Where("status = ? AND to_user_id IN ? AND from_user_id NOT IN ?",
+		model.ServerTransferStatusPending, userIDs, userIDs).Find(&pending).Error; err != nil {
+		return err
+	}
+	for i := range pending {
+		if _, ok := ServerShared.Get(pending[i].ServerID); !ok {
+			// Nothing to hand back; OnUsersDeleted settles the row.
+			continue
+		}
+		if _, err := c.revertTransition(pending[i].ID, model.ServerTransferStatusCancelled, "destination user deleted"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // OnUsersDeleted terminates any Pending transfer whose FromUserID or
 // ToUserID is in userIDs, BEFORE the caller drops the corresponding User
 // rows. revertTransition's Cancel/Fail/Timeout paths blindly write
@@ -1327,10 +1432,12 @@ func (c *ServerTransferClass) OnServersDeleted(serverIDs []uint64) {
 // to a nonexistent ToUserID. Settle the row up-front instead, mirroring
 // OnServersDeleted's CAS + in-memory cleanup pattern.
 //
-// We deliberately do NOT touch model.Server here — the live owner may be
+// We deliberately do NOT touch Server.UserID here — the live owner may be
 // a third party (chained transfers) or the surviving counterparty, and the
 // caller's own delete loop (singleton.OnUserDelete) is responsible for any
-// servers still attributed to the deleted user.
+// servers still attributed to the deleted user. A server that is only on its
+// way to the deleted user is not one of those: the caller returns it to its
+// surviving source with ReturnPendingToSource first.
 func (c *ServerTransferClass) OnUsersDeleted(userIDs []uint64) {
 	if len(userIDs) == 0 {
 		return
@@ -1367,20 +1474,53 @@ func (c *ServerTransferClass) OnUsersDeleted(userIDs []uint64) {
 		terminated = append(terminated, t)
 	}
 
+	servers := make([]*model.Server, len(terminated))
+	for i := range terminated {
+		servers[i], _ = ServerShared.Get(terminated[i].ServerID)
+	}
+
+	// Unlike revertTransition, ownership is not rolled back: the server stays
+	// with ToUserID, and it got there without MarkVerified, so the agent never
+	// proved it left the source side. Nothing the source side holds as this
+	// server's agent may survive that:
+	//
+	//   - credentials: the per-server slots are dropped regardless of transfer
+	//     id. Register keeps terminalSecretRecovery and verifiedHandshakes of
+	//     EARLIER transfers alive for the Pending window, and an id-matched
+	//     delete would leave those secrets authenticating as the new owner's
+	//     server (a restart already refuses to rebuild them once Server.UserID
+	//     no longer matches). A stale slot would also keep
+	//     ServerControlTransitioning true and lock the new owner out.
+	//   - streams: RequestTask and ReportSystemState authenticate only when
+	//     they are opened, and no agent reconnect is going to replace them.
+	//
+	// The task stream is detached inside the critical section that drops the
+	// pending entry. ServerControlTransitioning reads under c.mu, so the new
+	// owner's tasks, held back while Pending, can never be admitted while the
+	// source side's stream is still published. SetTaskStream(nil) is a
+	// non-blocking pointer swap; the ServerShared lookup and the revocations
+	// that take locks of their own stay outside c.mu.
 	c.mu.Lock()
 	for i := range terminated {
 		t := &terminated[i]
 		if existing, ok := c.pending[t.ServerID]; ok && existing.ID == t.ID {
 			delete(c.pending, t.ServerID)
 		}
-		if existing, ok := c.revertDeliveries[t.ServerID]; ok && existing.ID == t.ID {
-			delete(c.revertDeliveries, t.ServerID)
-		}
-		if existing, ok := c.terminalSecretRecovery[t.ServerID]; ok && existing.ID == t.ID {
-			delete(c.terminalSecretRecovery, t.ServerID)
+		delete(c.revertDeliveries, t.ServerID)
+		delete(c.terminalSecretRecovery, t.ServerID)
+		delete(c.verifiedHandshakes, t.ServerID)
+		if servers[i] != nil {
+			servers[i].SetTaskStream(nil)
 		}
 	}
 	c.mu.Unlock()
+
+	for i := range terminated {
+		if servers[i] != nil {
+			servers[i].RevokeStateStream()
+		}
+		ServerTransferRevokeStreamsForServer(terminated[i].ServerID)
+	}
 
 	for i := range terminated {
 		c.broadcast(&terminated[i])

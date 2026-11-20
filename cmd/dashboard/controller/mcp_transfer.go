@@ -166,6 +166,10 @@ func mintTransferToken(e transferEntry) (string, error) {
 	return tok, nil
 }
 
+// consumeTransferToken returns the entry without an error only when the URL may
+// be used. A URL that is genuine (known and correctly signed) but refused for
+// its direction or age is returned together with the error, for audit
+// attribution only: the refusal belongs to the token the URL was minted from.
 func consumeTransferToken(tok string, dir transferDirection) (*transferEntry, error) {
 	raw, ok := transferEntries.LoadAndDelete(tok)
 	if !ok {
@@ -183,10 +187,10 @@ func consumeTransferToken(tok string, dir transferDirection) (*transferEntry, er
 		return nil, errors.New("transfer token signature mismatch")
 	}
 	if e.Direction != dir {
-		return nil, errors.New("transfer token direction mismatch")
+		return &e, errors.New("transfer token direction mismatch")
 	}
 	if time.Now().After(e.ExpiresAt) {
-		return nil, errors.New("transfer token expired")
+		return &e, errors.New("transfer token expired")
 	}
 	return &e, nil
 }
@@ -334,6 +338,9 @@ func handleFsUploadURL(c *gin.Context, raw json.RawMessage) (any, error) {
 	if err := decodeToolArgs(raw, &args); err != nil {
 		return nil, err
 	}
+	if len(args.Mode) > maxFsOptionLen {
+		return nil, errMCPInvalidArgs("mode too long")
+	}
 	if args.IfMatchSHA256 != "" {
 		if _, decErr := hex.DecodeString(args.IfMatchSHA256); decErr != nil || len(args.IfMatchSHA256) != 64 {
 			return nil, errMCPInvalidArgs("if_match_sha256 must be 64 hex chars")
@@ -447,7 +454,7 @@ func transferDownloadHandler(c *gin.Context) {
 	tok := c.Param("token")
 	entry, err := consumeTransferToken(tok, transferDirDownload)
 	if err != nil {
-		writeTransferFailureAudit(c, nil, "fs.download", classifyTransferConsumeError(err), err)
+		writeTransferFailureAudit(c, entry, "fs.download", classifyTransferConsumeError(err), err)
 		c.String(http.StatusUnauthorized, err.Error())
 		return
 	}
@@ -463,6 +470,15 @@ func transferDownloadHandler(c *gin.Context) {
 		return
 	}
 	c.Request = c.Request.WithContext(singleton.WithServerControlIdentity(c.Request.Context(), entry.UserID, transferUser.Role.IsAdmin()))
+	// Admit against the user's own share before the agent is contacted, so one
+	// user's parked downloads cannot take every process-wide spool slot.
+	releaseShare, ok := acquireDownloadSpoolShare(entry.UserID)
+	if !ok {
+		writeTransferFailureAudit(c, entry, "fs.download", model.MCPOutcomeRateLimited, errTooManyDownloadsForUser)
+		c.String(http.StatusTooManyRequests, errTooManyDownloadsForUser.Error())
+		return
+	}
+	defer releaseShare()
 	ctx, stop := transferRevokableContext(c, entry)
 	defer stop()
 
@@ -499,19 +515,25 @@ func transferDownloadHandler(c *gin.Context) {
 		return
 	}
 
-	if err := relayDownloadFrames(c, stream, hdr.Size); err != nil {
+	// From the first body byte on, the client decides how long the response
+	// takes and whether its last byte is ever read. The row is therefore written
+	// once the agent's payload is complete and verified, before any of it is
+	// sent; a failure after that is the client's and adds no agent_error row.
+	recorded := false
+	err = relayDownloadFrames(ctx, c, stream, hdr.Size, func() {
+		recorded = true
+		_ = singleton.DB.Create(&model.MCPAuditLog{
+			UserID:   entry.UserID,
+			TokenID:  entry.TokenID,
+			Tool:     "fs.download",
+			ServerID: entry.ServerID,
+			Outcome:  model.MCPOutcomeOK,
+			IP:       c.GetString(model.CtxKeyRealIPStr),
+		}).Error
+	})
+	if err != nil && !recorded {
 		writeTransferFailureAudit(c, entry, "fs.download", model.MCPOutcomeAgentError, err)
-		return
 	}
-
-	_ = singleton.DB.Create(&model.MCPAuditLog{
-		UserID:   entry.UserID,
-		TokenID:  entry.TokenID,
-		Tool:     "fs.download",
-		ServerID: entry.ServerID,
-		Outcome:  model.MCPOutcomeOK,
-		IP:       c.GetString(model.CtxKeyRealIPStr),
-	}).Error
 }
 
 // transferUploadHandler 处理 POST /mcp/upload/:token；body 转发到 agent，
@@ -550,7 +572,7 @@ func transferUploadHandler(c *gin.Context) {
 	tok := c.Param("token")
 	entry, err := consumeTransferToken(tok, transferDirUpload)
 	if err != nil {
-		writeTransferFailureAudit(c, nil, "fs.upload", classifyTransferConsumeError(err), err)
+		writeTransferFailureAudit(c, entry, "fs.upload", classifyTransferConsumeError(err), err)
 		c.String(http.StatusUnauthorized, err.Error())
 		return
 	}
@@ -634,7 +656,8 @@ func transferUploadHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, model.FsWriteResult{Size: int64(final.Size), SHA256: hex.EncodeToString(final.SHA256)})
+	// Recorded before the reply, like fs.download: the write to the client is
+	// not a step the audit row may wait for.
 	_ = singleton.DB.Create(&model.MCPAuditLog{
 		UserID:   entry.UserID,
 		TokenID:  entry.TokenID,
@@ -643,11 +666,12 @@ func transferUploadHandler(c *gin.Context) {
 		Outcome:  model.MCPOutcomeOK,
 		IP:       c.GetString(model.CtxKeyRealIPStr),
 	}).Error
+	c.JSON(http.StatusOK, model.FsWriteResult{Size: int64(final.Size), SHA256: hex.EncodeToString(final.SHA256)})
 }
 
 // writeTransferFailureAudit 是 fs.upload / fs.download HTTP handler 失败路径
 // 共用的审计写入。outcome 必须用 model.MCPOutcome* 常量；entry 可以是 nil
-// （token consume 阶段就失败时拿不到 entry，UserID/TokenID/ServerID 写 0）。
+// （token 未知/已用/签名不符时拿不到 entry，UserID/TokenID/ServerID 写 0）。
 //
 // Anonymous failures (entry == nil) go through transferAnonAuditThrottleShared
 // per-IP sampler so an unauthenticated attacker cannot flood mcp_audit_log
@@ -761,15 +785,52 @@ type frameReceiver interface {
 // download to do so.
 var downloadSpoolSlots = make(chan struct{}, 32)
 
-func relayDownloadFrames(c *gin.Context, stream io.ReadWriteCloser, size int64) error {
+// maxDownloadSpoolsPerUser is one user's share of downloadSpoolSlots. A slot
+// stays taken until the agent has delivered the file and the HTTP client has
+// read it, or maxTransferDuration expires; without a share, one user parking
+// downloads on their own server would refuse every other user's download.
+const maxDownloadSpoolsPerUser = 4
+
+var (
+	downloadSpoolUsersMu sync.Mutex
+	downloadSpoolUsers   = make(map[uint64]int)
+)
+
+var errTooManyDownloadsForUser = errors.New("too many concurrent downloads for this user")
+
+// acquireDownloadSpoolShare counts an in-flight download against its user.
+// The returned release is safe to call more than once.
+func acquireDownloadSpoolShare(userID uint64) (func(), bool) {
+	downloadSpoolUsersMu.Lock()
+	defer downloadSpoolUsersMu.Unlock()
+	if downloadSpoolUsers[userID] >= maxDownloadSpoolsPerUser {
+		return nil, false
+	}
+	downloadSpoolUsers[userID]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			downloadSpoolUsersMu.Lock()
+			defer downloadSpoolUsersMu.Unlock()
+			if downloadSpoolUsers[userID]--; downloadSpoolUsers[userID] <= 0 {
+				delete(downloadSpoolUsers, userID)
+			}
+		})
+	}, true
+}
+
+// beforeBody, when not nil, is called once the payload is complete and
+// verified, before the first byte of it is written to the client.
+func relayDownloadFrames(ctx context.Context, c *gin.Context, stream io.ReadWriteCloser, size int64, beforeBody func()) error {
 	// Bound disk occupancy independently of IOStream quotas and client reading speed.
 	select {
 	case downloadSpoolSlots <- struct{}{}:
-		defer func() { <-downloadSpoolSlots }()
 	default:
 		c.String(http.StatusTooManyRequests, "download capacity exceeded")
 		return errors.New("download capacity exceeded")
 	}
+	releaseSlot := sync.OnceFunc(func() { <-downloadSpoolSlots })
+	defer releaseSlot()
 	responseControl := http.NewResponseController(c.Writer)
 	// The deployed net/http writer supports deadlines; in-memory recorders may not.
 	if err := responseControl.SetWriteDeadline(time.Now().Add(maxTransferDuration)); err != nil && !errors.Is(err, http.ErrNotSupported) {
@@ -782,6 +843,16 @@ func relayDownloadFrames(c *gin.Context, stream io.ReadWriteCloser, size int64) 
 		return err
 	}
 	defer spool.Close()
+	// The slots are shared by every user, so the tmpfile and the slot also
+	// follow the transfer context (maxTransferDuration, PAT revocation, client
+	// disconnect) instead of only this function returning: the Read from the
+	// agent and the Write to the HTTP client below are in the peer's hands, and
+	// a stalled HTTP/2 connection does not fail a blocked Write at its deadline.
+	stopRelease := context.AfterFunc(ctx, func() {
+		spool.Close()
+		releaseSlot()
+	})
+	defer stopRelease()
 
 	// Hash the relayed bytes inline; we compare against the trailing
 	// NZTO declared sha256 in validateDownloadFinal so corrupt or
@@ -791,6 +862,9 @@ func relayDownloadFrames(c *gin.Context, stream io.ReadWriteCloser, size int64) 
 
 	remaining := size
 	header := make([]byte, 4+8)
+	// Built once: the agent chooses the chunk length, so nothing the relay
+	// does per frame may cost an allocation or a write(2) of its own.
+	sink := io.MultiWriter(spool, hasher)
 	for remaining > 0 {
 		if _, err := io.ReadFull(stream, header); err != nil {
 			c.String(http.StatusBadGateway, "stream relay failed: "+err.Error())
@@ -816,11 +890,14 @@ func relayDownloadFrames(c *gin.Context, stream io.ReadWriteCloser, size int64) 
 			c.String(http.StatusBadGateway, "stream relay failed: zero-length data frame while payload incomplete")
 			return errMCPMidstreamAbort
 		}
-		if int64(chunkLen) > remaining {
+		// Compare before narrowing: a length of 1<<63 or more is negative as
+		// int64, would pass a signed comparison and make io.CopyN copy nothing,
+		// which is the zero-progress frame rejected above under another spelling.
+		if chunkLen > uint64(remaining) {
 			c.String(http.StatusBadGateway, "agent oversent: more data bytes than declared size")
 			return errMCPMidstreamAbort
 		}
-		n, err := io.CopyN(io.MultiWriter(spool, hasher), stream, int64(chunkLen))
+		n, err := io.CopyN(sink, stream, int64(chunkLen))
 		if err != nil {
 			c.String(http.StatusBadGateway, "stream relay failed: "+err.Error())
 			return err
@@ -847,6 +924,9 @@ func relayDownloadFrames(c *gin.Context, stream io.ReadWriteCloser, size int64) 
 	if err := spool.Rewind(); err != nil {
 		c.String(http.StatusInternalServerError, "transfer spool rewind: "+err.Error())
 		return err
+	}
+	if beforeBody != nil {
+		beforeBody()
 	}
 	c.Header("Content-Type", "application/octet-stream")
 	c.Header("Content-Length", strconv.FormatInt(size, 10))
@@ -1069,6 +1149,9 @@ func revalidateTransferEntry(e *transferEntry) error {
 	var user model.User
 	if err := singleton.DB.First(&user, e.UserID).Error; err != nil {
 		return errors.New("originating user no longer exists")
+	}
+	if user.TokenVersion != tok.UserVersion {
+		return errors.New("originating api token revoked by credential change")
 	}
 	if user.Role != model.RoleAdmin && (srv.GetUserID() != e.UserID || singleton.ServerControlTransitioning(e.ServerID)) {
 		return errors.New("target server is no longer owned by the originating user")

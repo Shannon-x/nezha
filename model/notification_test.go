@@ -1,8 +1,13 @@
 package model
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -274,6 +279,18 @@ func TestNotificationSendRejectsLoopbackTarget(t *testing.T) {
 	}
 }
 
+func TestNotificationSendContextStopsWhenCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	bundle := NotificationServerBundle{
+		Notification: &Notification{URL: "http://1.1.1.1/", RequestMethod: NotificationRequestMethodGET},
+		Loc:          time.Local,
+	}
+	if err := bundle.SendContext(ctx, "probe"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the canceled context to end the request, got %v", err)
+	}
+}
+
 func TestNotificationTargetRejectsBlockedRanges(t *testing.T) {
 	cases := []string{
 		"http://0.0.0.0/",
@@ -350,7 +367,7 @@ func TestNotificationHTTPClientInvertsVerifyTLSFlag(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			client, err := newNotificationHTTPClient("https://1.1.1.1/webhook", tc.verifyTLS)
+			client, err := newNotificationHTTPClient(context.Background(), "https://1.1.1.1/webhook", tc.verifyTLS)
 			if err != nil {
 				t.Fatalf("expected client construction: %v", err)
 			}
@@ -364,6 +381,154 @@ func TestNotificationHTTPClientInvertsVerifyTLSFlag(t *testing.T) {
 			if got := transport.TLSClientConfig.InsecureSkipVerify; got != tc.wantSkipVerifyOn {
 				t.Fatalf("verifyTLS=%v: expected InsecureSkipVerify=%v, got %v",
 					tc.verifyTLS, tc.wantSkipVerifyOn, got)
+			}
+		})
+	}
+}
+
+// A form field or a query parameter may hold a JSON document (Slack's
+// payload={"text":"#NEZHA#"}). The message and the server name are not written
+// by the owner of the notification, so they must stay inside the JSON string
+// the template puts them in.
+func TestNotificationPlaceholderValuesStayInNestedJSON(t *testing.T) {
+	message := `[Down] mail Error: x", "channel": "#mallory", "text": "[Good] mail`
+	name := `web", "channel": "#mallory`
+	ns := NotificationServerBundle{
+		Server: &Server{Name: name},
+		Loc:    time.Local,
+	}
+	check := func(what, document string) {
+		t.Helper()
+		var got map[string]string
+		if err := json.Unmarshal([]byte(document), &got); err != nil {
+			t.Fatalf("%s is not JSON: %v: %s", what, err, document)
+		}
+		expect := map[string]string{"channel": "#oncall", "server": name, "text": message}
+		if !maps.Equal(got, expect) {
+			t.Fatalf("placeholder value changed the JSON document in %s: %s", what, document)
+		}
+	}
+
+	for _, payload := range []string{
+		`{"channel": "#oncall", "server": "#SERVER.NAME#", "text": "#NEZHA#"}`,
+		`"{\"channel\": \"#oncall\", \"server\": \"#SERVER.NAME#\", \"text\": \"#NEZHA#\"}"`,
+	} {
+		ns.Notification = &Notification{
+			URL:           "https://example.com/hook",
+			RequestMethod: NotificationRequestMethodPOST,
+			RequestType:   NotificationRequestTypeForm,
+			RequestBody:   `{"plain": "[#SERVER.NAME#] #NEZHA#", "payload": ` + payload + `}`,
+		}
+		body, err := ns.reqBody(message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		form, err := url.ParseQuery(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		check("form field", form.Get("payload"))
+		// Plain text fields are sent as before.
+		if got := form.Get("plain"); got != "["+name+"] "+message {
+			t.Fatalf("plain text field changed: %s", got)
+		}
+	}
+
+	for _, query := range []string{
+		`payload={"channel":"%23oncall","server":"#SERVER.NAME#","text":"#NEZHA#"}`,
+		`payload=%7B%22channel%22%3A%22%23oncall%22%2C%22server%22%3A%22#SERVER.NAME#%22%2C%22text%22%3A%22#NEZHA#%22%7D`,
+	} {
+		ns.Notification = &Notification{
+			URL:           "https://example.com/hook?plain=[#SERVER.NAME#]+#NEZHA#&" + query,
+			RequestMethod: NotificationRequestMethodGET,
+		}
+		u, err := url.Parse(ns.reqURL(message))
+		if err != nil {
+			t.Fatal(err)
+		}
+		check("query parameter", u.Query().Get("payload"))
+		if got := u.Query().Get("plain"); got != "["+name+"] "+message {
+			t.Fatalf("plain text query parameter changed: %s", got)
+		}
+	}
+}
+
+func TestJSONTemplateEscape(t *testing.T) {
+	cases := map[string]bool{
+		// JSON documents
+		`{"text":"#NEZHA#"}`:                                         true,
+		` [{"text": "#SERVER.NAME#: #NEZHA#"}] `:                     true,
+		`{"text":"#NEZHA#","swap":#SERVER.SWAPUSED#}`:                true,
+		"{\n  \"channel\": \"#oncall\",\n  \"text\": \"#NEZHA#\"\n}": true,
+		// plain text
+		``:                           false,
+		`#NEZHA#`:                    false,
+		`"#NEZHA#"`:                  false,
+		`[#SERVER.NAME#]`:            false,
+		`[#SERVER.NAME#] #NEZHA#`:    false,
+		`["Nezha"] #NEZHA#`:          false,
+		`{#NEZHA#}`:                  false,
+		`{"text":"#NEZHA#"} #NEZHA#`: false,
+	}
+	for value, expect := range cases {
+		if got := jsonTemplateEscape(value) != nil; got != expect {
+			t.Errorf("jsonTemplateEscape(%q): JSON document %v, expected %v", value, got, expect)
+		}
+	}
+}
+
+func TestNotificationZeroTotalsRenderFiniteUsage(t *testing.T) {
+	const body = `{"mem": #SERVER.MEM#, "swap": #SERVER.SWAP#, "disk": #SERVER.DISK#}`
+	cases := []struct {
+		name   string
+		host   Host
+		state  HostState
+		expect string
+	}{
+		{
+			name:   "no host report yet",
+			expect: `{"mem": 0.000000, "swap": 0.000000, "disk": 0.000000}`,
+		},
+		{
+			name:   "zero totals with non-zero usage",
+			state:  HostState{MemUsed: 1, SwapUsed: 1, DiskUsed: 1},
+			expect: `{"mem": 0.000000, "swap": 0.000000, "disk": 0.000000}`,
+		},
+		{
+			name:   "host without swap",
+			host:   Host{MemTotal: 4, DiskTotal: 4},
+			state:  HostState{MemUsed: 1, DiskUsed: 1},
+			expect: `{"mem": 0.250000, "swap": 0.000000, "disk": 0.250000}`,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ns := NotificationServerBundle{
+				Notification: &Notification{
+					RequestMethod: NotificationRequestMethodPOST,
+					RequestType:   NotificationRequestTypeJSON,
+					RequestBody:   body,
+				},
+				Server: &Server{Host: &c.host, State: &c.state},
+				Loc:    time.UTC,
+			}
+			got, err := ns.reqBody(msg)
+			if err != nil {
+				t.Fatalf("Error: %s", err)
+			}
+			if !json.Valid([]byte(got)) {
+				t.Fatalf("zero totals rendered an invalid JSON body: %s", got)
+			}
+			if got != c.expect {
+				t.Fatalf("Expected %s, but got %s", c.expect, got)
+			}
+
+			formatMetricUnits := true
+			ns.Notification.FormatMetricUnits = &formatMetricUnits
+			got = ns.replaceParamsInString("#SERVER.MEM# #SERVER.SWAP# #SERVER.DISK#", msg, nil)
+			if strings.Contains(got, "NaN") || strings.Contains(got, "Inf") {
+				t.Fatalf("zero totals rendered a non-finite usage: %s", got)
 			}
 		})
 	}

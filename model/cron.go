@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -34,7 +35,24 @@ type Cron struct {
 	ServersRaw string       `json:"-"`
 }
 
+// MaxCronCommandBytes bounds Cron.Command for the same reason
+// MaxServiceTargetBytes bounds Service.Target: the command becomes pb.Task.Data
+// and is encoded once per covered Agent every time the task fires.
+const MaxCronCommandBytes = 32 * 1024
+
+// ValidateCronCommand is checked wherever a Cron is persisted, scheduled, or
+// dispatched.
+func ValidateCronCommand(command string) error {
+	if len(command) > MaxCronCommandBytes {
+		return fmt.Errorf("task command exceeds %d bytes", MaxCronCommandBytes)
+	}
+	return nil
+}
+
 func (c *Cron) BeforeSave(tx *gorm.DB) error {
+	if err := ValidateCronCommand(c.Command); err != nil {
+		return err
+	}
 	if data, err := json.Marshal(c.Servers); err != nil {
 		return err
 	} else {
@@ -44,7 +62,12 @@ func (c *Cron) BeforeSave(tx *gorm.DB) error {
 }
 
 func (c *Cron) AfterFind(tx *gorm.DB) error {
-	return json.Unmarshal([]byte(c.ServersRaw), &c.Servers)
+	if err := json.Unmarshal([]byte(c.ServersRaw), &c.Servers); err != nil {
+		return err
+	}
+	// 收敛历史上落库的重复 server ID（GHSA-8fgr-wx8p-v6q7）。
+	c.Servers = UniqueIDs(c.Servers)
+	return nil
 }
 
 // HasPermission 扩展默认的 owner/admin 检查，使得 PAT 的 server_ids 白名单

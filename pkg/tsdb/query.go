@@ -299,9 +299,11 @@ func (db *TSDB) queryMetricByServiceID(metric MetricType, serviceID string, tr s
 		timestamps, values = block.AppendRowsWithTimeRangeFilter(timestamps, values, tr)
 
 		for i := range timestamps {
+			// Releases before FiniteStateValue stored agent-reported ±Inf as is;
+			// read it back as the value that is stored for such a report today.
 			result[serverID] = append(result[serverID], metricPoint{
 				timestamp: timestamps[i],
-				value:     values[i],
+				value:     model.FiniteStateValue(values[i]),
 			})
 		}
 	}
@@ -426,7 +428,10 @@ func downsampleMetrics(points []rawDataPoint, interval time.Duration, useLastVal
 	result := make([]MetricDataPoint, 0)
 
 	bucketStart := (points[0].timestamp / intervalMs) * intervalMs
-	var total float64
+	// Keep a running mean instead of a sum: samples are agent-supplied, and a sum
+	// of finite samples can overflow to Inf, which JSON cannot encode. The mean
+	// of finite samples is always finite.
+	var mean float64
 	var count int
 	var last rawDataPoint
 
@@ -435,7 +440,7 @@ func downsampleMetrics(points []rawDataPoint, interval time.Duration, useLastVal
 		if useLastValue {
 			value = last.value
 		} else if count > 0 {
-			value = total / float64(count)
+			value = mean
 		}
 		result = append(result, MetricDataPoint{
 			Timestamp: bucketStart,
@@ -448,11 +453,12 @@ func downsampleMetrics(points []rawDataPoint, interval time.Duration, useLastVal
 		if key != bucketStart {
 			flushBucket()
 			bucketStart = key
-			total = 0
+			mean = 0
 			count = 0
 		}
-		total += p.value
 		count++
+		// Divide before subtracting: p.value-mean itself may overflow.
+		mean += p.value/float64(count) - mean/float64(count)
 		last = p
 	}
 	flushBucket()
@@ -518,9 +524,10 @@ func (db *TSDB) QueryServerMetrics(serverID uint64, metric MetricType, period Qu
 		timestamps, values = block.AppendRowsWithTimeRangeFilter(timestamps, values, tr)
 
 		for i := range timestamps {
+			// Stored ±Inf from older releases, see queryMetricByServiceID.
 			points = append(points, rawDataPoint{
 				timestamp: timestamps[i],
-				value:     values[i],
+				value:     model.FiniteStateValue(values[i]),
 			})
 		}
 	}
@@ -665,9 +672,10 @@ func (db *TSDB) queryMetricByServerID(metric MetricType, serverID string, tr sto
 		timestamps, values = block.AppendRowsWithTimeRangeFilter(timestamps, values, tr)
 
 		for i := range timestamps {
+			// Stored ±Inf from older releases, see queryMetricByServiceID.
 			result[serviceID] = append(result[serviceID], metricPoint{
 				timestamp: timestamps[i],
-				value:     values[i],
+				value:     model.FiniteStateValue(values[i]),
 			})
 		}
 	}

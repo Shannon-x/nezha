@@ -290,12 +290,10 @@ func listServerServices(c *gin.Context) ([]*model.ServiceInfos, error) {
 
 	m := singleton.ServerShared.GetList()
 	server, ok := m[serverID]
-	if !ok || server == nil {
+	// Hidden and unknown IDs deliberately share one response so sequential
+	// server IDs cannot be enumerated by callers who may not view them.
+	if !ok || server == nil || !userCanViewServer(c, server) {
 		return nil, singleton.Localizer.ErrorT("server not found")
-	}
-
-	if !userCanViewServer(c, server) {
-		return nil, singleton.Localizer.ErrorT("unauthorized")
 	}
 	_, isMember := c.Get(model.CtxKeyAuthorizedUser)
 
@@ -488,6 +486,12 @@ func createService(c *gin.Context) (uint64, error) {
 	if err := model.ValidateServiceMonitorType(uint64(mf.Type)); err != nil {
 		return 0, err
 	}
+	if err := model.ValidateServiceLatency(mf.MinLatency, mf.MaxLatency); err != nil {
+		return 0, err
+	}
+	if err := model.ValidateServiceTarget(strings.TrimSpace(mf.Target)); err != nil {
+		return 0, err
+	}
 
 	if !isValidServiceCover(mf.Cover) {
 		return 0, singleton.Localizer.ErrorT("permission denied")
@@ -514,6 +518,7 @@ func createService(c *gin.Context) (uint64, error) {
 	m.RecoverTriggerTasks = mf.RecoverTriggerTasks
 	m.FailTriggerTasks = mf.FailTriggerTasks
 
+	normalizeServiceReferences(&m)
 	if err := validateServers(c, &m); err != nil {
 		return 0, err
 	}
@@ -555,6 +560,12 @@ func updateService(c *gin.Context) (any, error) {
 	if err := model.ValidateServiceMonitorType(uint64(mf.Type)); err != nil {
 		return nil, err
 	}
+	if err := model.ValidateServiceLatency(mf.MinLatency, mf.MaxLatency); err != nil {
+		return nil, err
+	}
+	if err := model.ValidateServiceTarget(strings.TrimSpace(mf.Target)); err != nil {
+		return nil, err
+	}
 
 	if !isValidServiceCover(mf.Cover) {
 		return nil, singleton.Localizer.ErrorT("permission denied")
@@ -586,23 +597,29 @@ func updateService(c *gin.Context) (any, error) {
 	m.RecoverTriggerTasks = mf.RecoverTriggerTasks
 	m.FailTriggerTasks = mf.FailTriggerTasks
 
+	normalizeServiceReferences(&m)
 	if err := validateServers(c, &m); err != nil {
 		return 0, err
 	}
 
-	if err := singleton.DB.Save(&m).Error; err != nil {
+	if err := singleton.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&m).Error; err != nil {
+			return err
+		}
+		// Use the same normalized coverage for persisted settings and history.
+		ids := utils.MapKeysToSlice(m.SkipServers)
+		history := tx.Where("service_id = ? AND server_id > 0", m.ID)
+		if m.Cover == model.ServiceCoverAll {
+			if len(ids) == 0 {
+				return nil
+			}
+			history = history.Where("server_id IN ?", ids)
+		} else if len(ids) > 0 {
+			history = history.Where("server_id NOT IN ?", ids)
+		}
+		return history.Delete(&model.ServiceHistory{}).Error
+	}); err != nil {
 		return nil, newGormError("%v", err)
-	}
-
-	// 清理已不在监控范围内的服务器的历史记录
-	skipServers := utils.MapKeysToSlice(mf.SkipServers)
-	if m.Cover == model.ServiceCoverAll {
-		err = singleton.DB.Unscoped().Delete(&model.ServiceHistory{}, "service_id = ? and server_id in (?)", m.ID, skipServers).Error
-	} else {
-		err = singleton.DB.Unscoped().Delete(&model.ServiceHistory{}, "service_id = ? and server_id not in (?) and server_id > 0", m.ID, skipServers).Error
-	}
-	if err != nil {
-		return nil, err
 	}
 
 	if err := singleton.ServiceSentinelShared.Update(&m); err != nil {

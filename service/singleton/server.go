@@ -92,10 +92,35 @@ func (c *ServerClass) unlockLifecycleWrite() {
 	c.lifecycleMu.Unlock()
 }
 
+// Update registers a new server. An edit of a registered server goes through
+// Replace.
 func (c *ServerClass) Update(s *model.Server, uuid string) {
 	c.lockLifecycleWrite()
 	defer c.unlockLifecycleWrite()
 
+	c.publish(s, uuid)
+}
+
+// Replace publishes s, an edited copy of a registered server, in place of the
+// running one and hands it the running server's runtime state. The lookup and
+// the swap share one lifecycle lock so a Delete cannot fall in between; if the
+// server is no longer registered it reports false and changes nothing, rather
+// than bring the deleted server back.
+func (c *ServerClass) Replace(s *model.Server) bool {
+	c.lockLifecycleWrite()
+	defer c.unlockLifecycleWrite()
+
+	current, ok := c.Get(s.ID)
+	if !ok || current == nil {
+		return false
+	}
+	s.CopyFromRunningServer(current)
+	c.publish(s, "")
+	return true
+}
+
+// publish must be called with the lifecycle lock held for writing.
+func (c *ServerClass) publish(s *model.Server, uuid string) {
 	c.listMu.Lock()
 
 	c.list[s.ID] = s
@@ -126,7 +151,10 @@ func (c *ServerClass) Delete(idList []uint64) {
 		if !ok {
 			continue
 		}
-		delete(c.uuidToID, s.UUID)
+		// Only unmap a UUID that still belongs to this server.
+		if c.uuidToID[s.UUID] == id {
+			delete(c.uuidToID, s.UUID)
+		}
 		delete(c.list, id)
 	}
 
@@ -172,12 +200,27 @@ func (c *ServerClass) UpdateDDNS(server *model.Server, ip *model.IP) error {
 
 	for _, provider := range providers {
 		domains := server.OverrideDDNSDomains[provider.GetProfileID()]
+		// The checks above hold for this instant only; the worker outlives the
+		// call, so it repeats them against current state as it goes.
+		provider.Revoked = func() bool { return !c.ddnsUpdateInForce(server, provider.DDNSProfile) }
 		go func(provider *ddns.Provider) {
 			provider.UpdateDomain(ctx, domains...)
 		}(provider)
 	}
 
 	return nil
+}
+
+// ddnsUpdateInForce reports whether an update started for server with profile
+// may still proceed: both are still the registered objects (neither deleted
+// nor replaced by an edit; a server edit starts its own update) and the
+// profile still belongs to the server's current owner.
+func (c *ServerClass) ddnsUpdateInForce(server *model.Server, profile *model.DDNSProfile) bool {
+	if current, ok := c.Get(server.ID); !ok || current != server {
+		return false
+	}
+	current, ok := DDNSShared.Get(profile.ID)
+	return ok && current == profile && profile.GetUserID() == server.GetUserID()
 }
 
 func (c *ServerClass) sortList() {

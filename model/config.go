@@ -1,12 +1,15 @@
 package model
 
 import (
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/go-viper/mapstructure/v2"
 	kmaps "github.com/knadh/koanf/maps"
@@ -75,7 +78,8 @@ func (d *DatabaseConfig) mysqlDSN() string {
 	if port == 0 {
 		port = 3306
 	}
-	return d.Username + ":" + d.Password + "@tcp(" + d.Host + ":" + itoa(port) + ")/" + d.DBName + "?charset=utf8mb4&parseTime=True&loc=Local"
+	// Update handlers use RowsAffected to distinguish missing rows from idempotent edits.
+	return d.Username + ":" + d.Password + "@tcp(" + d.Host + ":" + itoa(port) + ")/" + d.DBName + "?charset=utf8mb4&parseTime=True&loc=Local&clientFoundRows=true"
 }
 
 func (d *DatabaseConfig) postgresDSN() string {
@@ -205,6 +209,10 @@ type Config struct {
 
 	k        *koanf.Koanf `json:"-"`
 	filePath string       `json:"-"`
+
+	// envKeys holds the top-level settings supplied by NZ_* variables, in the
+	// underscore-free spelling of the environment. save() consults it.
+	envKeys map[string]any `json:"-"`
 }
 
 type HTTPSConf struct {
@@ -247,8 +255,10 @@ func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
 	if err != nil {
 		return err
 	}
+	c.envKeys = c.k.Raw()
 
 	if _, err := os.Stat(path); err == nil {
+		c.restrictFileMode()
 		err = c.k.Load(file.Provider(path), new(utils.KubeYAML), koanf.WithMergeFunc(mergeDedup))
 		if err != nil {
 			return err
@@ -326,7 +336,10 @@ func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
 		c.OnlineStatsDays = DefaultOnlineStatsDays
 	}
 
+	// Both mirrors must be loaded before the first-start Save below, which
+	// persists them; otherwise it would record MCP as explicitly disabled.
 	c.jwtIPChangeAllowed.Store(c.AllowJWTIPChange)
+	c.mcpEnabled.Store(c.EnableMCP)
 
 	if c.AgentSecretKey == "" {
 		c.AgentSecretKey, err = utils.GenerateRandomString(32)
@@ -337,8 +350,6 @@ func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
 			return err
 		}
 	}
-
-	c.mcpEnabled.Store(c.EnableMCP)
 
 	return nil
 }
@@ -429,7 +440,20 @@ func (c *Config) patchYAMLField(key string, value any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.filePath, out, 0600)
+	c.restrictFileMode()
+	return writeFileAtomic(c.filePath, out)
+}
+
+// restrictFileMode drops group/other access from an existing config file.
+// The 0600 given to os.WriteFile only applies when it creates the file, so a
+// config.yaml that was there before (seeded by an installer, bind-mounted,
+// written by an older version) would otherwise keep its mode while holding
+// jwt_secret_key and agent_secret_key. Failure is not fatal: the file may be
+// on a read-only mount or owned by another user.
+func (c *Config) restrictFileMode() {
+	if err := utils.RestrictFileToOwner(c.filePath); err != nil && !os.IsNotExist(err) {
+		log.Printf("NEZHA>> config file %s may be readable by other users: %v", c.filePath, err)
+	}
 }
 
 func (c *Config) save() error {
@@ -439,19 +463,53 @@ func (c *Config) save() error {
 	if err != nil {
 		return err
 	}
-	// Public JSON must omit the signing key, but file-backed keys must survive Save.
-	if !c.jwtSecretFromEnv && c.JWTSecretKey != "" {
-		var persisted map[string]any
-		if err := yaml.Unmarshal(data, &persisted); err != nil {
-			return err
+	var persisted map[string]any
+	if err := yaml.Unmarshal(data, &persisted); err != nil {
+		return err
+	}
+	// omitempty drops a setting that was switched off or cleared, but on the
+	// next start config.yaml overrides an NZ_* variable only for the keys it
+	// contains. Write such a setting explicitly, or the environment would
+	// silently undo a saved revocation (MCP kill switch, member NAT domains, ...).
+	for key, empty := range omitemptySettings(reflect.TypeFor[Config](), map[string]any{}) {
+		if _, saved := persisted[key]; saved {
+			continue
 		}
-		persisted["jwt_secret_key"] = c.JWTSecretKey
-		data, err = yaml.Marshal(persisted)
-		if err != nil {
-			return err
+		if _, fromEnv := c.envKeys[strings.ReplaceAll(key, "_", "")]; fromEnv {
+			persisted[key] = empty
 		}
 	}
+	// Public JSON must omit the signing key, but file-backed keys must survive Save.
+	if !c.jwtSecretFromEnv && c.JWTSecretKey != "" {
+		persisted["jwt_secret_key"] = c.JWTSecretKey
+	}
+	data, err = yaml.Marshal(persisted)
+	if err != nil {
+		return err
+	}
 	return c.write(data)
+}
+
+// omitemptySettings collects the empty value of every top-level setting that
+// marshalling leaves out of config.yaml while it is empty, by its file key.
+func omitemptySettings(t reflect.Type, settings map[string]any) map[string]any {
+	for i := range t.NumField() {
+		field := t.Field(i)
+		if field.Anonymous {
+			omitemptySettings(field.Type, settings)
+			continue
+		}
+		name, options, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "" || name == "-" || !strings.Contains(options, "omitempty") {
+			continue
+		}
+		empty := reflect.Zero(field.Type)
+		if field.Type.Kind() == reflect.Slice {
+			empty = reflect.MakeSlice(field.Type, 0, 0) // "[]" rather than "null"
+		}
+		settings[name] = empty.Interface()
+	}
+	return settings
 }
 
 func (c *Config) write(data []byte) error {
@@ -460,7 +518,43 @@ func (c *Config) write(data []byte) error {
 		return err
 	}
 
-	return os.WriteFile(c.filePath, data, 0600)
+	c.restrictFileMode()
+	return writeFileAtomic(c.filePath, data)
+}
+
+// writeFileAtomic replaces path through a temporary file in the same directory.
+// os.WriteFile truncates before it writes: a write that fails half-way (full
+// disk, crash) would leave a cut config.yaml, and the next start would silently
+// fill every lost key (listen_host, force_auth, https, ...) with its default.
+func writeFileAtomic(path string, data []byte) error {
+	// Replace the file a symlink points to, not the symlink itself.
+	if target, err := filepath.EvalSymlinks(path); err == nil {
+		path = target
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*") // created 0600
+	if err != nil {
+		return err
+	}
+	_, err = tmp.Write(data)
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		if err = os.Rename(tmp.Name(), path); err == nil {
+			return nil
+		}
+		// A bind-mounted single file is a mount point and cannot be renamed over;
+		// it can only be rewritten in place.
+		if errors.Is(err, syscall.EBUSY) {
+			err = os.WriteFile(path, data, 0600)
+		}
+	}
+	_ = os.Remove(tmp.Name())
+	return err
 }
 
 func compareVersion(left, right string) int {

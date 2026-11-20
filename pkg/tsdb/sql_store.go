@@ -3,11 +3,14 @@ package tsdb
 import (
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"sync"
 	"time"
 
 	"gorm.io/gorm"
+
+	"github.com/nezhahq/nezha/model"
 )
 
 // SQLStore 基于关系型数据库的 TSDB 存储实现
@@ -277,7 +280,7 @@ func (s *SQLStore) QueryServiceHistory(serviceID uint64, period QueryPeriod) (*S
 		}
 		grouped[serverID] = append(grouped[serverID], rawDataPoint{
 			timestamp: createdAt.UnixMilli(),
-			value:     delay,
+			value:     model.FiniteStateValue(delay),
 			status:    float64(status),
 			hasDelay:  true,
 			hasStatus: true,
@@ -299,6 +302,13 @@ func (s *SQLStore) QueryServiceHistory(serviceID uint64, period QueryPeriod) (*S
 	return result, nil
 }
 
+// Older stores can contain infinite delays. Count each as zero in the daily
+// average, keeping the status counts and the contribution of finite samples.
+const dailyServiceStatsSelect = "DATE(created_at) as date, " +
+	"SUM(CASE WHEN status >= 1 THEN 1 ELSE 0 END) as up, " +
+	"SUM(CASE WHEN status < 1 THEN 1 ELSE 0 END) as down, " +
+	"AVG(CASE WHEN delay BETWEEN ? AND ? THEN delay ELSE 0 END) as avg_delay"
+
 // QueryServiceDailyStats 查询服务每日统计
 func (s *SQLStore) QueryServiceDailyStats(serviceID uint64, today time.Time, days int) ([]DailyServiceStats, error) {
 	s.mu.RLock()
@@ -319,7 +329,7 @@ func (s *SQLStore) QueryServiceDailyStats(serviceID uint64, today time.Time, day
 
 	var results []aggResult
 	if err := s.db.Model(&TSDBServiceMetric{}).
-		Select("DATE(created_at) as date, SUM(CASE WHEN status >= 1 THEN 1 ELSE 0 END) as up, SUM(CASE WHEN status < 1 THEN 1 ELSE 0 END) as down, AVG(delay) as avg_delay").
+		Select(dailyServiceStatsSelect, -math.MaxFloat64, math.MaxFloat64).
 		Where("service_id = ? AND created_at >= ? AND created_at < ?", serviceID, start, today).
 		Group("DATE(created_at)").
 		Find(&results).Error; err != nil {
@@ -381,7 +391,7 @@ func (s *SQLStore) QueryServicesDailyStats(serviceIDs []uint64, today time.Time,
 
 	var results []aggResult
 	if err := s.db.Model(&TSDBServiceMetric{}).
-		Select("service_id, DATE(created_at) as date, SUM(CASE WHEN status >= 1 THEN 1 ELSE 0 END) as up, SUM(CASE WHEN status < 1 THEN 1 ELSE 0 END) as down, AVG(delay) as avg_delay").
+		Select("service_id, "+dailyServiceStatsSelect, -math.MaxFloat64, math.MaxFloat64).
 		Where("service_id IN ? AND created_at >= ? AND created_at < ?", serviceIDs, start, today).
 		Group("service_id, DATE(created_at)").
 		Find(&results).Error; err != nil {
@@ -440,7 +450,7 @@ func (s *SQLStore) QueryServerMetrics(serverID uint64, metric MetricType, period
 		}
 		points = append(points, rawDataPoint{
 			timestamp: createdAt.UnixMilli(),
-			value:     value,
+			value:     model.FiniteStateValue(value),
 		})
 	}
 
@@ -478,7 +488,7 @@ func (s *SQLStore) QueryServiceHistoryByServerID(serverID uint64, period QueryPe
 		}
 		grouped[serviceID] = append(grouped[serviceID], rawDataPoint{
 			timestamp: createdAt.UnixMilli(),
-			value:     delay,
+			value:     model.FiniteStateValue(delay),
 			status:    float64(status),
 			hasDelay:  true,
 			hasStatus: true,

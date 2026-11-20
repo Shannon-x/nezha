@@ -3,6 +3,7 @@ package singleton
 import (
 	"cmp"
 	"fmt"
+	"log"
 	"slices"
 	"strings"
 	"sync"
@@ -19,11 +20,21 @@ import (
 
 const alertTriggerCronResultAuthorizationTTL = 24 * time.Hour
 
+// Result authorizations are reserved for every cover, once per server on every
+// run of a scheduled cron. An agent that never answers must not grow its list
+// without bound, and the sweep over all lists must not run for each dispatched
+// task or reported result.
+const (
+	cronResultAuthorizationLimit         = 64
+	cronResultAuthorizationSweepInterval = time.Minute
+)
+
 type CronClass struct {
 	class[uint64, *model.Cron]
 	*cron.Cron
 	pendingAlertTriggerTasksMu sync.Mutex
 	pendingAlertTriggerTasks   map[uint64]map[uint64][]time.Time
+	pendingAlertTriggerSweptAt time.Time
 	closeOnce                  sync.Once
 }
 
@@ -38,8 +49,39 @@ func (c *CronClass) Close() {
 	})
 }
 
+// cronSpecParser is the cron.WithSeconds() grammar without the specs that
+// robfig/cron mishandles. A field made only of commas parses to an empty bit
+// mask without an error, and SpecSchedule.Next then steps through five years
+// of candidate times on the scheduler goroutine shared by every job. A TZ=
+// prefix that is not followed by any field panics inside Parser.Parse.
+type cronSpecParser struct {
+	cron.Parser
+}
+
+func newCronSpecParser() cronSpecParser {
+	return cronSpecParser{cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)}
+}
+
+func (p cronSpecParser) Parse(spec string) (cron.Schedule, error) {
+	if (strings.HasPrefix(spec, "TZ=") || strings.HasPrefix(spec, "CRON_TZ=")) && !strings.Contains(spec, " ") {
+		return nil, fmt.Errorf("missing fields in spec %q", spec)
+	}
+	schedule, err := p.Parser.Parse(spec)
+	if err != nil {
+		return nil, err
+	}
+	if s, ok := schedule.(*cron.SpecSchedule); ok {
+		for _, bits := range []uint64{s.Second, s.Minute, s.Hour, s.Dom, s.Month, s.Dow} {
+			if bits == 0 {
+				return nil, fmt.Errorf("empty field in spec %q", spec)
+			}
+		}
+	}
+	return schedule, nil
+}
+
 func NewCronClass() *CronClass {
-	cronx := cron.New(cron.WithSeconds(), cron.WithLocation(Loc))
+	cronx := cron.New(cron.WithParser(newCronSpecParser()), cron.WithLocation(Loc))
 	list := make(map[uint64]*model.Cron)
 
 	var sortedList []*model.Cron
@@ -50,13 +92,18 @@ func NewCronClass() *CronClass {
 	notificationMsgMap := make(map[uint64]*strings.Builder)
 
 	for _, cron := range sortedList {
+		// Rows stored before the command limit existed are reported like a
+		// failed registration instead of being scheduled or left triggerable.
+		err = model.ValidateCronCommand(cron.Command)
 		// 触发任务类型无需注册
-		if cron.TaskType == model.CronTypeTriggerTask {
+		if err == nil && cron.TaskType == model.CronTypeTriggerTask {
 			list[cron.ID] = cron
 			continue
 		}
 		// 注册计划任务
-		cron.CronJobID, err = cronx.AddFunc(cron.Scheduler, CronTrigger(cron))
+		if err == nil {
+			cron.CronJobID, err = cronx.AddFunc(cron.Scheduler, CronTrigger(cron))
+		}
 		if err == nil {
 			list[cron.ID] = cron
 		} else {
@@ -103,15 +150,22 @@ func (c *CronClass) Update(cr *model.Cron) {
 }
 
 func (c *CronClass) Delete(idList []uint64) {
+	var jobs []cron.EntryID
 	c.listMu.Lock()
 	for _, id := range idList {
 		cr := c.list[id]
 		if cr != nil && cr.CronJobID != 0 {
-			c.Cron.Remove(cr.CronJobID)
+			jobs = append(jobs, cr.CronJobID)
 		}
 		delete(c.list, id)
 	}
 	c.listMu.Unlock()
+	// Every Remove makes the scheduler copy and sort all of its entries, so
+	// the jobs are unregistered after the lock every task lookup waits for is
+	// released.
+	for _, job := range jobs {
+		c.Cron.Remove(job)
+	}
 	c.deleteAlertTriggerCronResultAuthorizations(idList)
 
 	c.sortList()
@@ -152,19 +206,18 @@ func cronCanBeTriggeredByOwner(cr *model.Cron, triggerOwner uint64) bool {
 }
 
 func CanReportCronResult(cr *model.Cron, reporter *model.Server) bool {
-	if cr == nil || reporter == nil || !cronCanSendToServer(cr, reporter) {
+	if cr == nil || reporter == nil || !serverTaskResultAdmitted(reporter, cr.UserID) {
 		return false
 	}
-	if cr.Cover == model.CronCoverAll {
-		return !slices.Contains(cr.Servers, reporter.ID)
+	if cr.Cover == model.CronCoverAll && slices.Contains(cr.Servers, reporter.ID) {
+		return false
 	}
-	if cr.Cover == model.CronCoverIgnoreAll {
-		return slices.Contains(cr.Servers, reporter.ID)
+	if cr.Cover == model.CronCoverIgnoreAll && !slices.Contains(cr.Servers, reporter.ID) {
+		return false
 	}
-	if cr.Cover == model.CronCoverAlertTrigger {
-		return CronShared != nil && CronShared.consumeAlertTriggerCronResult(cr.ID, reporter.ID)
-	}
-	return false
+	// Cover only says the cron may be sent to this reporter. Whatever the cover,
+	// one result is accepted for each task CronTrigger dispatched to it.
+	return CronShared != nil && CronShared.consumeAlertTriggerCronResult(cr.ID, reporter.ID)
 }
 
 func (c *CronClass) reserveAlertTriggerCronResult(cronID uint64, serverID uint64) {
@@ -179,7 +232,11 @@ func (c *CronClass) reserveAlertTriggerCronResult(cronID uint64, serverID uint64
 	if c.pendingAlertTriggerTasks[cronID] == nil {
 		c.pendingAlertTriggerTasks[cronID] = make(map[uint64][]time.Time)
 	}
-	c.pendingAlertTriggerTasks[cronID][serverID] = append(c.pendingAlertTriggerTasks[cronID][serverID], now.Add(alertTriggerCronResultAuthorizationTTL))
+	expiresAtList := append(c.pendingAlertTriggerTasks[cronID][serverID], now.Add(alertTriggerCronResultAuthorizationTTL))
+	if len(expiresAtList) > cronResultAuthorizationLimit {
+		expiresAtList = expiresAtList[len(expiresAtList)-cronResultAuthorizationLimit:]
+	}
+	c.pendingAlertTriggerTasks[cronID][serverID] = expiresAtList
 }
 
 func (c *CronClass) revokeAlertTriggerCronResult(cronID uint64, serverID uint64) {
@@ -206,17 +263,22 @@ func (c *CronClass) consumeAlertTriggerCronResult(cronID uint64, serverID uint64
 	c.pendingAlertTriggerTasksMu.Lock()
 	defer c.pendingAlertTriggerTasksMu.Unlock()
 
-	c.pruneExpiredAlertTriggerCronResultsLocked(time.Now())
-	return c.consumeAlertTriggerCronResultLocked(cronID, serverID)
+	now := time.Now()
+	c.pruneExpiredAlertTriggerCronResultsLocked(now)
+	return c.consumeAlertTriggerCronResultLocked(cronID, serverID, now)
 }
 
-func (c *CronClass) consumeAlertTriggerCronResultLocked(cronID uint64, serverID uint64) bool {
+func (c *CronClass) consumeAlertTriggerCronResultLocked(cronID uint64, serverID uint64, now time.Time) bool {
 	serverTasks := c.pendingAlertTriggerTasks[cronID]
 	expiresAtList := serverTasks[serverID]
-	if len(expiresAtList) == 0 {
-		return false
+	// The sweep may not have run since these expired; the oldest come first.
+	for len(expiresAtList) > 0 && !expiresAtList[0].After(now) {
+		expiresAtList = expiresAtList[1:]
 	}
-	expiresAtList = expiresAtList[1:]
+	consumed := len(expiresAtList) > 0
+	if consumed {
+		expiresAtList = expiresAtList[1:]
+	}
 	if len(expiresAtList) == 0 {
 		delete(serverTasks, serverID)
 	} else {
@@ -225,10 +287,14 @@ func (c *CronClass) consumeAlertTriggerCronResultLocked(cronID uint64, serverID 
 	if len(serverTasks) == 0 {
 		delete(c.pendingAlertTriggerTasks, cronID)
 	}
-	return true
+	return consumed
 }
 
 func (c *CronClass) pruneExpiredAlertTriggerCronResultsLocked(now time.Time) {
+	if now.Sub(c.pendingAlertTriggerSweptAt) < cronResultAuthorizationSweepInterval {
+		return
+	}
+	c.pendingAlertTriggerSweptAt = now
 	for cronID, serverTasks := range c.pendingAlertTriggerTasks {
 		for serverID, expiresAtList := range serverTasks {
 			validExpiresAtList := expiresAtList[:0]
@@ -268,6 +334,12 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 		crIgnoreMap[server] = true
 	}
 	return func() {
+		if err := model.ValidateCronCommand(cr.Command); err != nil {
+			// Defense in depth, as in DispatchTask: every covered Agent gets
+			// its own encoded copy of the command.
+			log.Printf("NEZHA>> CronTrigger rejected task %d: %v", cr.ID, err)
+			return
+		}
 		if cr.Cover == model.CronCoverAlertTrigger {
 			if len(triggerServer) == 0 {
 				return
@@ -317,11 +389,19 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 				continue
 			}
 			if s.GetTaskStream() != nil {
-				_ = s.QueueTaskGuarded(&pb.Task{
+				cronShared := CronShared
+				if cronShared != nil {
+					cronShared.reserveAlertTriggerCronResult(cr.ID, s.ID)
+				}
+				// The agent can answer as soon as the queued task is sent, so
+				// reserve first and roll back when the task was never queued.
+				if err := s.QueueTaskGuarded(&pb.Task{
 					Id:   cr.ID,
 					Data: cr.Command,
 					Type: model.TaskTypeCommand,
-				}, ServerTaskAdmission(s.ID, cr.UserID))
+				}, ServerTaskAdmission(s.ID, cr.UserID)); err != nil && cronShared != nil {
+					cronShared.revokeAlertTriggerCronResult(cr.ID, s.ID)
+				}
 			} else {
 				// 保存当前服务器状态信息
 				curServer := model.Server{}

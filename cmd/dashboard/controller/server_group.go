@@ -28,28 +28,19 @@ func listServerGroup(c *gin.Context) ([]*model.ServerGroupResponseItem, error) {
 
 	_, isMember := c.Get(model.CtxKeyAuthorizedUser)
 	isAdmin := isMember && callerIsAdmin(c)
-	pat := patAccessorFromContext(c)
-	patLimited := pat != nil && patHasServerWhitelist(c)
-
-	visibleServerIDs := make(map[uint64]struct{})
-	if !isMember {
-		for _, server := range singleton.ServerShared.GetSortedListForGuest() {
-			visibleServerIDs[server.ID] = struct{}{}
-		}
-	}
+	patLimited := patHasServerWhitelist(c)
 
 	groupServers := make(map[uint64][]uint64, 0)
 	var sgs []model.ServerGroupServer
 	if err := singleton.DB.Find(&sgs).Error; err != nil {
 		return nil, err
 	}
+	servers := singleton.ServerShared.GetList()
 	for _, s := range sgs {
-		if !isMember {
-			if _, ok := visibleServerIDs[s.ServerId]; !ok {
-				continue
-			}
-		}
-		if pat != nil && !pat.CanAccessServer(s.ServerId) {
+		server := servers[s.ServerId]
+		// userCanViewServer applies the PAT whitelist and HideForGuest to
+		// guests and to members who do not own the server alike.
+		if !userCanViewServer(c, server) || !serverGroupMembershipInForce(&s, server) {
 			continue
 		}
 		if _, ok := groupServers[s.ServerGroupId]; !ok {
@@ -76,6 +67,22 @@ func listServerGroup(c *gin.Context) ([]*model.ServerGroupResponseItem, error) {
 	}
 
 	return sgRes, nil
+}
+
+// serverGroupMembershipInForce reports whether a stored membership row would
+// still pass the write-side CheckPermission for the user who wrote it: that
+// user owns the server or is an admin. Server ownership can change after the
+// row was written (ServerTransfer rewrites Server.UserID only), and the row
+// must not keep the server in its former owner's group. Same rule as
+// cronCanSendToServer.
+func serverGroupMembershipInForce(row *model.ServerGroupServer, server *model.Server) bool {
+	if server == nil {
+		return false
+	}
+	if row.UserID == server.GetUserID() {
+		return true
+	}
+	return model.OwnerIsAdminLookup != nil && model.OwnerIsAdminLookup(row.UserID)
 }
 
 // New server group
@@ -249,16 +256,8 @@ func batchDeleteServerGroup(c *gin.Context) (any, error) {
 		}
 	}
 
-	if pat := patAccessorFromContext(c); pat != nil && patHasServerWhitelist(c) {
-		var members []model.ServerGroupServer
-		if err := singleton.DB.Where("server_group_id in (?)", sgs).Find(&members).Error; err != nil {
-			return nil, err
-		}
-		for _, m := range members {
-			if !pat.CanAccessServer(m.ServerId) {
-				return nil, singleton.Localizer.ErrorT("permission denied")
-			}
-		}
+	if !patGroupMembershipAccessAllowed(c, sgs...) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
 	}
 
 	err := singleton.DB.Transaction(func(tx *gorm.DB) error {
