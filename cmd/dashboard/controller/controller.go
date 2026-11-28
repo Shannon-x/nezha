@@ -128,6 +128,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	// 「自我管理」类端点 — 显式禁止 PAT 访问（避免 PAT 自我提权链）。
 	patForbidden := restPATForbiddenMiddleware()
 	auth.POST("/refresh-token", patForbidden, authMiddleware.RefreshHandler)
+	auth.POST("/logout", patForbidden, commonHandler(logout))
 	auth.GET("/profile", patForbidden, commonHandler(getProfile))
 	auth.POST("/profile", patForbidden, commonHandler(updateProfile))
 	auth.POST("/oauth2/:provider/unbind", patForbidden, commonHandler(unbindOauth2))
@@ -221,6 +222,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.PATCH("/setting", restScopeMiddleware(model.ScopeAdminAll), adminHandler(updateConfig))
 	auth.POST("/maintenance", restScopeMiddleware(model.ScopeAdminAll), adminHandler(runMaintenance))
 	registerFrontendRoutes(auth)
+	registerBackupRoutes(auth, patForbidden)
 
 	r.NoRoute(fallbackToFrontend(frontendDist))
 }

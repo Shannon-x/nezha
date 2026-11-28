@@ -28,13 +28,9 @@ import (
 // @Router /service [get]
 func showService(c *gin.Context) (*model.ServiceResponse, error) {
 	res, err, _ := requestGroup.Do(serviceResponseCacheKey(c), func() (any, error) {
-		singleton.AlertsLock.RLock()
-		defer singleton.AlertsLock.RUnlock()
 		stats := filterServiceStatsForViewer(c, singleton.ServiceSentinelShared.CopyStats())
-		var cycleTransferStats map[uint64]model.CycleTransferStats
-		copier.Copy(&cycleTransferStats, singleton.AlertsCycleTransferStatsStore)
 		return []any{
-			stats, filterCycleTransferStatsForViewer(c, cycleTransferStats),
+			stats, filterCycleTransferStatsForViewer(c, singleton.CopyCycleTransferStats()),
 		}, nil
 	})
 	if err != nil {
@@ -664,16 +660,22 @@ func batchDeleteService(c *gin.Context) (any, error) {
 		}
 	}
 
+	// Only the caller's rows: see deletableRowIDs.
+	var deleted []uint64
 	err := singleton.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Unscoped().Delete(&model.Service{}, "id in (?)", ids).Error; err != nil {
+		var err error
+		if deleted, err = deletableRowIDs(tx, c, &model.Service{}, ids); err != nil || len(deleted) == 0 {
 			return err
 		}
-		return tx.Unscoped().Delete(&model.ServiceHistory{}, "service_id in (?)", ids).Error
+		if err := tx.Unscoped().Delete(&model.Service{}, "id in (?)", deleted).Error; err != nil {
+			return err
+		}
+		return tx.Unscoped().Delete(&model.ServiceHistory{}, "service_id in (?)", deleted).Error
 	})
 	if err != nil {
 		return nil, err
 	}
-	singleton.ServiceSentinelShared.Delete(ids)
+	singleton.ServiceSentinelShared.Delete(deleted)
 	singleton.ServiceSentinelShared.UpdateServiceList()
 	return nil, nil
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/copier"
+	"gorm.io/gorm"
 
 	"github.com/nezhahq/nezha/model"
 	"github.com/nezhahq/nezha/pkg/utils"
@@ -57,8 +58,15 @@ func createNAT(c *gin.Context) (uint64, error) {
 		return 0, singleton.Localizer.ErrorT("have invalid server id")
 	}
 	server, ok := singleton.ServerShared.Get(nf.ServerID)
-	if !ok {
+	if !ok && callerIsAdmin(c) {
+		// Administrators see every server: no IDs to hide from them.
 		return 0, singleton.Localizer.ErrorT("have invalid server id")
+	}
+	// Ownership before the control lease: its transition error only exists
+	// for real servers, so checking it first told members which foreign
+	// server IDs exist. Unknown and foreign IDs share one response.
+	if !ok || !server.HasPermission(c) {
+		return 0, singleton.Localizer.ErrorT("permission denied")
 	}
 	releaseControl, controlErr := beginServerControl(c, server.ID)
 	if controlErr != nil {
@@ -119,8 +127,13 @@ func updateNAT(c *gin.Context) (any, error) {
 		return nil, singleton.Localizer.ErrorT("have invalid server id")
 	}
 	server, ok := singleton.ServerShared.Get(nf.ServerID)
-	if !ok {
+	if !ok && callerIsAdmin(c) {
+		// Administrators see every server: no IDs to hide from them.
 		return nil, singleton.Localizer.ErrorT("have invalid server id")
+	}
+	// Ownership before the control lease, as in createNAT.
+	if !ok || !server.HasPermission(c) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
 	}
 	releaseControl, controlErr := beginServerControl(c, server.ID)
 	if controlErr != nil {
@@ -182,10 +195,19 @@ func batchDeleteNAT(c *gin.Context) (any, error) {
 		return nil, singleton.Localizer.ErrorT("permission denied")
 	}
 
-	if err := singleton.DB.Unscoped().Delete(&model.NAT{}, "id in (?)", n).Error; err != nil {
+	// Only the caller's rows: see deletableRowIDs.
+	var deleted []uint64
+	err := singleton.DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		if deleted, err = deletableRowIDs(tx, c, &model.NAT{}, n); err != nil || len(deleted) == 0 {
+			return err
+		}
+		return tx.Unscoped().Delete(&model.NAT{}, "id in (?)", deleted).Error
+	})
+	if err != nil {
 		return nil, newGormError("%v", err)
 	}
 
-	singleton.NATShared.Delete(n)
+	singleton.NATShared.Delete(deleted)
 	return nil, nil
 }

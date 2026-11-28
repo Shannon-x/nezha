@@ -1,7 +1,12 @@
 package controller
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"net/http"
+	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/net/idna"
@@ -33,12 +38,54 @@ const (
 	maxRulesPerAlertRule = 64
 )
 
-// restRequestBodyLimitMiddleware 在 handler 解析请求体前装上 MaxBytesReader。
-// 必须挂在路由组上：gin 的 ShouldBindJSON 会完整读取请求体。
+// restRequestBodyReadTimeout bounds reading an /api/v1 request body.
+var restRequestBodyReadTimeout = 60 * time.Second
+
+// restRequestBodyLimitMiddleware limits the request body and reads it
+// completely before the next middlewares run. It must be mounted on the
+// /api/v1 group, ahead of authentication.
+//
+// Reading the body here is what makes authentication see the request as a
+// whole: the credential (PAT or JWT session) used to be checked when the
+// request head arrived, while the handler read the body later. A client
+// could send the head, hold the body back across a password change that
+// revoked its token, and still have the request executed.
 func restRequestBodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Body != nil && c.Request.Body != http.NoBody {
-			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+			// The restore upload carries a whole backup file; it streams the
+			// body to disk with its own limit instead of binding it, so it
+			// cannot be buffered here. It only accepts administrators' login
+			// sessions (no API tokens), and applying a restore re-verifies the
+			// administrator.
+			if c.Request.Method == http.MethodPost && c.FullPath() == backupUploadPath {
+				c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, backupUploadBodyLimit())
+				c.Next()
+				return
+			}
+			// The dashboard clears the connection read deadline once the head
+			// is read (long-lived streams share the port), so bound this read
+			// itself: a client must not hold the connection, and the buffered
+			// body, open forever. Normal bodies are small JSON documents.
+			// Writers without deadline support (tests) simply read without one.
+			deadline := http.NewResponseController(c.Writer)
+			_ = deadline.SetReadDeadline(time.Now().Add(restRequestBodyReadTimeout))
+			body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes))
+			if err != nil {
+				status := http.StatusBadRequest
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					status = http.StatusRequestTimeout
+				}
+				// The rest of the body was not read. Close the connection after
+				// the reply: otherwise the server first tries to drain the body
+				// to reuse the connection and, with a client that stopped
+				// sending, never writes this reply at all.
+				c.Header("Connection", "close")
+				c.AbortWithStatusJSON(status, model.CommonResponse[any]{Error: err.Error()})
+				return
+			}
+			_ = deadline.SetReadDeadline(time.Time{})
+			c.Request.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		c.Next()
 	}

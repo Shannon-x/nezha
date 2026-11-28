@@ -8,10 +8,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	_ "time/tzdata"
 
 	"github.com/gin-gonic/gin"
@@ -41,22 +43,18 @@ var (
 	frontendDist embed.FS
 )
 
-// initDatabase 初始化数据库连接
-// 优先使用配置文件中的数据库配置，如果未配置则使用命令行参数 (向后兼容)
-// Initialize database connection. Uses config file settings with CLI override for backward compatibility.
-func initDatabase() error {
-	dbConfig := singleton.Conf.Database
-
-	// 向后兼容: 如果配置文件中未指定数据库类型，且命令行指定了 -db 参数，则使用 SQLite
-	// Backward compatibility: If database type is not specified in config and -db CLI flag is provided, use SQLite
-	if dbConfig.Type == "" {
-		dbConfig.Type = model.DBTypeSQLite
-		if dashboardCliParam.DatabaseLocation != "" {
-			dbConfig.Path = dashboardCliParam.DatabaseLocation
+// databaseConfig resolves the legacy -db flag only when no driver is configured.
+func (p DashboardCliParam) databaseConfig(db model.DatabaseConfig) model.DatabaseConfig {
+	if db.Type == "" {
+		db.Type = model.DBTypeSQLite
+		if p.DatabaseLocation != "" {
+			db.Path = p.DatabaseLocation
 		}
 	}
-
-	return singleton.InitDB(dbConfig)
+	if db.Type == model.DBTypeSQLite && db.Path == "" {
+		db.Path = "data/sqlite.db"
+	}
+	return db
 }
 
 func initSystem(bus chan<- *model.Service) error {
@@ -172,8 +170,15 @@ func main() {
 		os.Exit(0)
 	}
 
-	serviceSentinelDispatchBus := make(chan *model.Service) // 用于传递服务监控任务信息的channel
-	// 初始化 dao 包
+	// An interrupted swap may have moved config.yaml. Recover its journal
+	// before reading the config to resolve the active SQLite file.
+	restoreBoot, err := dashboardCliParam.bootRestore()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var dbConfig model.DatabaseConfig
+	serviceSentinelDispatchBus := make(chan *model.Service)
 	if err := utils.FirstError(singleton.InitFrontendTemplates,
 		func() error { return singleton.InitConfigFromPath(dashboardCliParam.ConfigFile) },
 		initIDCodec,
@@ -185,18 +190,52 @@ func main() {
 			}
 			return nil
 		},
-		func() error { return initDatabase() },
+		func() error {
+			dbConfig = dashboardCliParam.databaseConfig(singleton.Conf.Database)
+			return singleton.InitDB(dbConfig)
+		},
 		singleton.InitTSDB,
-		func() error { return initSystem(serviceSentinelDispatchBus) }); err != nil {
-		log.Fatal(err)
+		func() error { return initSystem(serviceSentinelDispatchBus) },
+		func() error {
+			return singleton.InitBackup(dashboardCliParam.ConfigFile, dbConfig.Path)
+		}); err != nil {
+		// Put the previous data back so that the next start (by the
+		// supervisor) runs with it; the failure is shown after login.
+		log.Fatal(finishRestoreStartup(restoreBoot, err))
+	}
+
+	// Applying a restore shuts the dashboard down gracefully and exits with
+	// a non-zero status, so that restart policies limited to failures
+	// (Restart=on-failure, restart: on-failure) start it again as well.
+	restartCtx, requestRestart := context.WithCancel(context.Background())
+	defer requestRestart()
+	var restartRequested atomic.Bool
+	singleton.RequestRestart = func() {
+		log.Println("NEZHA>> Restarting to apply a restore")
+		restartRequested.Store(true)
+		requestRestart()
 	}
 
 	l, err := openDashboardListener("tcp", dashboardListenerAddress(singleton.Conf.ListenHost, singleton.Conf.ListenPort), dashboardHTTPListener)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(finishRestoreStartup(restoreBoot, err))
 	}
 	receiptListener, err := openReceiptGateListener()
-	if err != nil {
+	var httpsListener net.Listener
+	var httpsCertificate *tls.Certificate
+	if err == nil {
+		httpsListener, httpsCertificate, err = openDashboardHTTPS(fmt.Sprintf("%s:%d", singleton.Conf.ListenHost, singleton.Conf.HTTPS.ListenPort),
+			singleton.Conf.HTTPS.ListenPort, singleton.Conf.HTTPS.TLSCertPath, singleton.Conf.HTTPS.TLSKeyPath)
+	}
+	// Database, configuration, listeners and certificate of a restored
+	// backup are in place: only now record the restore as successful. Any
+	// failure, including recording the commit, stops the dashboard.
+	if err = finishRestoreStartup(restoreBoot, err); err != nil {
+		for _, listener := range []net.Listener{l, receiptListener, httpsListener} {
+			if listener != nil {
+				_ = listener.Close()
+			}
+		}
 		log.Fatal(err)
 	}
 	if receiptListener != nil {
@@ -225,7 +264,7 @@ func main() {
 	muxServerHTTP.Protocols.SetUnencryptedHTTP2(true)
 
 	var muxServerHTTPS *http.Server
-	if singleton.Conf.HTTPS.ListenPort != 0 {
+	if httpsListener != nil {
 		muxServerHTTPS = &http.Server{
 			ReadHeaderTimeout: dashboardReadHeaderTimeout,
 			MaxHeaderBytes:    dashboardMaxHeaderBytes,
@@ -234,6 +273,7 @@ func main() {
 			Handler:           muxHandler,
 			TLSConfig: &tls.Config{
 				InsecureSkipVerify: singleton.Conf.HTTPS.InsecureTLS,
+				Certificates:       []tls.Certificate{*httpsCertificate},
 			},
 		}
 	}
@@ -241,11 +281,11 @@ func main() {
 	errChan := make(chan error, 2)
 	errHTTPS := errors.New("error from https server")
 
-	if err := graceful.Graceful(func() error {
+	if err := graceful.GracefulContext(restartCtx, func() error {
 		log.Printf("NEZHA>> Dashboard::START ON %s:%d", singleton.Conf.ListenHost, singleton.Conf.ListenPort)
-		if singleton.Conf.HTTPS.ListenPort != 0 {
+		if muxServerHTTPS != nil {
 			go func() {
-				errChan <- serveDashboardHTTPS(muxServerHTTPS, singleton.Conf.HTTPS.TLSCertPath, singleton.Conf.HTTPS.TLSKeyPath)
+				errChan <- serveDashboardHTTPS(muxServerHTTPS, httpsListener)
 			}()
 			log.Printf("NEZHA>> Dashboard::START ON %s:%d", singleton.Conf.ListenHost, singleton.Conf.HTTPS.ListenPort)
 		}
@@ -273,6 +313,10 @@ func main() {
 	}
 
 	close(errChan)
+	if restartRequested.Load() {
+		log.Println("NEZHA>> Exiting so that the supervisor restarts the dashboard with the restored data")
+		os.Exit(3)
+	}
 }
 
 // wireNATDashboardCredentialGate connects the NAT ingress to the real

@@ -244,10 +244,9 @@ type MemoryConf struct {
 	GoMemLimitMB int64 `koanf:"go_mem_limit_mb" json:"go_mem_limit_mb,omitempty"`
 }
 
-// Read 读取配置文件并应用
-func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
+// readValues decodes the configuration without persisting defaults or rotating secrets.
+func (c *Config) readValues(path string) error {
 	c.k = koanf.New(".")
-	c.filePath = path
 
 	err := c.k.Load(env.Provider("NZ_", ".", func(s string) string {
 		return strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(s, "NZ_")), "_", ".")
@@ -258,14 +257,30 @@ func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
 	c.envKeys = c.k.Raw()
 
 	if _, err := os.Stat(path); err == nil {
-		c.restrictFileMode()
 		err = c.k.Load(file.Provider(path), new(utils.KubeYAML), koanf.WithMergeFunc(mergeDedup))
 		if err != nil {
 			return err
 		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 
-	err = c.k.UnmarshalWithConf("", c, koanfConf(c))
+	return c.k.UnmarshalWithConf("", c, koanfConf(c))
+}
+
+// ReadRestoreSettings loads the host-selected database and capability locks
+// without initializing or rewriting the live or archived configuration.
+func ReadRestoreSettings(path string) (DatabaseConfig, SecurityConf, error) {
+	var c Config
+	err := c.readValues(path)
+	return c.Database, c.Security, err
+}
+
+// Read 读取配置文件并应用
+func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
+	c.filePath = path
+	c.restrictFileMode()
+	err := c.readValues(path)
 	if err != nil {
 		return err
 	}

@@ -105,6 +105,14 @@ database:
 | `NZ_DATABASE_SSLMODE` | SSL 模式 (PostgreSQL) | `disable`, `require` |
 | `NZ_DATABASE_PATH` | SQLite 文件路径 | `data/sqlite.db` |
 
+### 面板备份与恢复
+
+使用文件型 SQLite 时，管理员可以在面板中创建加密备份，保存到兼容 S3 的存储并按需恢复。使用默认 SQL 指标存储时，监控历史随 SQLite 一起备份和恢复。使用 VictoriaMetrics 时，其数据目录需要单独备份。
+
+如果备份包含面板配置，恢复时会检查它指向的 SQLite 文件和 `security` 开关。两者都与本机配置一致时才会替换数据。
+
+MySQL、PostgreSQL 和 SQL Server 部署请使用各自的数据库工具备份和恢复，并单独备份面板配置文件。
+
 ## 安全加固 | Security Hardening
 
 agent 以 root / SYSTEM 运行。面板一旦失守（弱口令、泄露的 JWT 或 API Token、面板漏洞），攻击者就能通过面板控制所有被监控的服务器。本 fork 增加了以下防护：
@@ -228,7 +236,7 @@ add your theme to [service/singleton/frontend-templates.yaml](service/singleton/
 <a href="https://github.com/dreamingsleeping" title="Nanjing Hopefun Network Technology Co. Ltd."><img src="https://avatars.githubusercontent.com/u/13828658?v=4" width="50;" alt="Nanjing Hopefun Network Technology Co. Ltd."/></a>
 <a href="https://github.com/Septrum101" title="Spetrum"><img src="https://avatars.githubusercontent.com/u/11692994?v=4" width="50;" alt="Spetrum"/></a>
 <a href="https://github.com/IamTaoChen" title="Tao Chen"><img src="https://avatars.githubusercontent.com/u/42793494?v=4" width="50;" alt="Tao Chen"/></a>
-<a href="https://github.com/nickfox-taterli" title="nickfox-taterli"><img src="https://avatars.githubusercontent.com/u/19658596?v=4" width="50;" alt="nickfox-taterli"/></a>
+<a href="https://github.com/nickfox-taterli" title="Tater Li"><img src="https://avatars.githubusercontent.com/u/19658596?v=4" width="50;" alt="Tater Li"/></a>
 <a href="https://github.com/TomyJan" title="TomyJan"><img src="https://avatars.githubusercontent.com/u/67973160?v=4" width="50;" alt="TomyJan"/></a>
 <a href="https://github.com/hmsjy2017" title="Tony"><img src="https://avatars.githubusercontent.com/u/42692274?v=4" width="50;" alt="Tony"/></a>
 <a href="https://github.com/ace-consultoria" title="ace-consultoria"><img src="https://avatars.githubusercontent.com/u/263983342?v=4" width="50;" alt="ace-consultoria"/></a>

@@ -1,0 +1,46 @@
+package controller
+
+import (
+	"errors"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"github.com/nezhahq/nezha/model"
+)
+
+// errBatchDeleteForeignServer rolls back a server batch delete that names a
+// server the caller may not delete or that does not exist.
+var errBatchDeleteForeignServer = errors.New("batch delete names a server the caller cannot delete")
+
+// deletableRowIDs returns the IDs among ids that the caller may delete,
+// read inside the deleting transaction tx: every existing row for an
+// administrator, only the caller's own rows for anyone else.
+//
+// Batch deletes must DELETE exactly these IDs and drop only them from the
+// in-memory registries. Their ownership checks run on a snapshot: the
+// registries skip IDs they do not hold yet (create handlers commit the row
+// before registering it) and a SELECT cannot see a row committed after it.
+// An unscoped "DELETE ... WHERE id IN (?)" therefore let a member delete
+// another user's freshly created rows by looping over the next IDs.
+func deletableRowIDs(tx *gorm.DB, c *gin.Context, table any, ids []uint64) ([]uint64, error) {
+	deletable := []uint64{}
+	if len(ids) == 0 {
+		return deletable, nil
+	}
+	// Keep ownership from changing between the read and the delete on
+	// databases with row-level locking. SQLite serializes writers itself.
+	query := tx.Model(table).Where("id IN (?)", ids)
+	switch tx.Dialector.Name() {
+	case model.DBTypeMySQL, model.DBTypePostgres:
+		query = query.Clauses(clause.Locking{Strength: clause.LockingStrengthUpdate})
+	case model.DBTypeSQLServer:
+		query = query.Joins("WITH (UPDLOCK)")
+	}
+	if !callerIsAdmin(c) {
+		query = query.Where("user_id = ?", getUid(c))
+	}
+	err := query.Pluck("id", &deletable).Error
+	return deletable, err
+}

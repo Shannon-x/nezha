@@ -47,15 +47,17 @@ func createFM(c *gin.Context) (*model.CreateFMResponse, error) {
 	}
 
 	server, _ := singleton.ServerShared.Get(id)
-	if server == nil {
+	if server == nil && callerIsAdmin(c) {
+		// Administrators see every server: no IDs to hide from them.
 		return nil, singleton.Localizer.ErrorT("server not found or not connected")
+	}
+	// Ownership first, as in createTerminal: unknown and foreign IDs share one
+	// response and a foreign agent's connection state stays hidden.
+	if server == nil || !server.HasPermission(c) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
 	}
 	if server.GetTaskStream() == nil {
 		return nil, singleton.Localizer.ErrorT("server not found or not connected")
-	}
-
-	if !server.HasPermission(c) {
-		return nil, singleton.Localizer.ErrorT("permission denied")
 	}
 
 	releaseControl, controlErr := beginServerControl(c, server.ID)
@@ -90,10 +92,16 @@ func createFM(c *gin.Context) (*model.CreateFMResponse, error) {
 		return nil, err
 	}
 
+	// 浏览器一直不连上来的话，这条流不能永远占着配额（见 CloseStreamUnlessUserConnects）。
+	rpc.NezhaHandlerSingleton.CloseStreamUnlessUserConnects(streamId, unattachedStreamTimeout)
+
 	return &model.CreateFMResponse{
 		SessionID: streamId,
 	}, nil
 }
+
+// unattachedStreamTimeout 是终端、文件会话创建后等待浏览器 WebSocket 连上来的最长时间。
+const unattachedStreamTimeout = time.Minute
 
 // Start FM stream
 // @Summary Start FM stream

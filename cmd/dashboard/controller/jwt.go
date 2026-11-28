@@ -65,16 +65,15 @@ func initParams() *jwt.GinJWTMiddleware {
 	return &jwt.GinJWTMiddleware{
 		Realm:      singleton.Conf.SiteName,
 		Key:        []byte(singleton.Conf.JWTSecretKey),
-		CookieName: "nz-jwt",
-		SendCookie: true,
+		CookieName: sessionCookieName,
+		// The cookie is written by setSessionCookie (per-request Secure,
+		// HttpOnly); gin-jwt only supports a fixed Secure flag.
+		SendCookie: false,
 		// Pin the signing algorithm so a future library default change (or an
 		// `alg: none` confusion attempt) cannot weaken token validation.
 		SigningAlgorithm: "HS256",
 		// Lax keeps OAuth callback redirects (top-level GET navigations from
 		// the provider domain) working while blocking cross-site POST CSRF.
-		// HttpOnly/Secure are intentionally left default: the frontend reads
-		// `!!document.cookie` for login-state display and many deployments
-		// terminate TLS at a proxy upstream — both warrant a separate change.
 		CookieSameSite: http.SameSiteLaxMode,
 		Timeout:        time.Hour * time.Duration(singleton.Conf.JWTTimeout),
 		MaxRefresh:     time.Hour * time.Duration(singleton.Conf.JWTTimeout),
@@ -93,6 +92,7 @@ func initParams() *jwt.GinJWTMiddleware {
 		TimeFunc:      time.Now,
 
 		LoginResponse: func(c *gin.Context, code int, token string, expire time.Time) {
+			setSessionCookie(c, token)
 			setCSRFCookie(c)
 			c.JSON(http.StatusOK, model.CommonResponse[model.LoginResponse]{
 				Success: true,
@@ -287,6 +287,7 @@ func refreshResponse(c *gin.Context, code int, token string, expire time.Time) {
 				"last_used_at": time.Now(),
 			}).Error
 	}
+	setSessionCookie(c, token)
 	setCSRFCookie(c)
 	c.JSON(http.StatusOK, model.CommonResponse[model.LoginResponse]{
 		Success: true,
@@ -295,6 +296,32 @@ func refreshResponse(c *gin.Context, code int, token string, expire time.Time) {
 			Expire: expire.Format(time.RFC3339),
 		},
 	})
+}
+
+// Logout
+// @Summary Logout
+// @Security BearerAuth
+// @Schemes
+// @Description Revoke the current login session and expire its cookie
+// @Tags auth required
+// @Produce json
+// @Success 200 {object} model.CommonResponse[any]
+// @Router /logout [post]
+//
+// The frontend used to "log out" by deleting its cookies only. That ends
+// nothing on the server: a token copied out of the browser (or sent in an
+// Authorization header) stayed valid until expiry. Revoke the session row so
+// identityHandler rejects it from now on. Only this session is revoked; the
+// user's other devices stay signed in.
+func logout(c *gin.Context) (any, error) {
+	keyID, _ := jwt.ExtractClaims(c)[jwtClaimKeyID].(string)
+	if keyID != "" {
+		if err := singleton.RevokeJWTSession(keyID); err != nil {
+			return nil, newGormError("%v", err)
+		}
+	}
+	clearSessionCookie(c)
+	return nil, nil
 }
 
 func fallbackAuthMiddleware(mw *jwt.GinJWTMiddleware) func(c *gin.Context) {

@@ -186,3 +186,19 @@ func TestBatchDeleteService_AllowsCoverIgnoreAllInsideWhitelist(t *testing.T) {
 	require.NoError(t, singleton.DB.Find(&rows).Error)
 	assert.Empty(t, rows)
 }
+
+func TestBatchDeleteServicePrunesOnlyDeletedServiceHistory(t *testing.T) {
+	setupServiceDispatchPATFixture(t)
+	ownID := insertServiceForDispatchTest(t, model.ServiceCoverAll, nil)
+	other := &model.Service{Common: model.Common{UserID: 200}, Type: model.TaskTypeTCPPing}
+	require.NoError(t, singleton.DB.Create(other).Error)
+	for _, id := range []uint64{ownID, other.ID} {
+		require.NoError(t, singleton.DB.Create(&model.ServiceHistory{ServiceID: id}).Error)
+	}
+
+	_, err := batchDeleteService(ctxAsMemberWithBody(100, []uint64{ownID, other.ID}))
+	require.NoError(t, err)
+	var remaining []uint64
+	require.NoError(t, singleton.DB.Model(&model.ServiceHistory{}).Pluck("service_id", &remaining).Error)
+	require.Equal(t, []uint64{other.ID}, remaining)
+}

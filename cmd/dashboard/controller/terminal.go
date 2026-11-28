@@ -37,15 +37,19 @@ func createTerminal(c *gin.Context) (*model.CreateTerminalResponse, error) {
 	}
 
 	server, _ := singleton.ServerShared.Get(createTerminalReq.ServerID)
-	if server == nil {
+	if server == nil && callerIsAdmin(c) {
+		// Administrators see every server: no IDs to hide from them.
 		return nil, singleton.Localizer.ErrorT("server not found or not connected")
+	}
+	// Ownership before anything else: unknown and foreign IDs share one
+	// response, and only the caller's own servers reveal whether the agent is
+	// connected. Checking the stream first told members which foreign server
+	// IDs exist and whether they are online.
+	if server == nil || !server.HasPermission(c) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
 	}
 	if server.GetTaskStream() == nil {
 		return nil, singleton.Localizer.ErrorT("server not found or not connected")
-	}
-
-	if !server.HasPermission(c) {
-		return nil, singleton.Localizer.ErrorT("permission denied")
 	}
 
 	releaseControl, controlErr := beginServerControl(c, server.ID)
@@ -79,6 +83,9 @@ func createTerminal(c *gin.Context) (*model.CreateTerminalResponse, error) {
 		cleanup()
 		return nil, err
 	}
+
+	// 浏览器一直不连上来的话，这条流不能永远占着配额（见 CloseStreamUnlessUserConnects）。
+	rpc.NezhaHandlerSingleton.CloseStreamUnlessUserConnects(streamId, unattachedStreamTimeout)
 
 	return &model.CreateTerminalResponse{
 		SessionID:  streamId,
